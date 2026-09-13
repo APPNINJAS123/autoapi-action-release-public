@@ -807,9 +807,9 @@ export class DeepSeekHarnessMigrationExecutor implements MigrationExecutor {
         if (contextForAttempt.editableRange !== undefined) {
           assertEditsInsideEvidenceGroup(edits, contextForAttempt)
         }
-        if (edits.length === 0 && repairValidationContextNamesFile(input, contextForAttempt.files)) {
+        if (edits.length === 0 && repairContextRequiresProgress(input, contextForAttempt.files)) {
           throw new HarnessExecutionError(
-            'Harness repair returned no edits for a file identified by the failing validation context',
+            'Harness repair returned no edits for a complete or explicitly failing validation context',
             true,
           )
         }
@@ -1335,13 +1335,26 @@ function chunkOperations(
   return chunks
 }
 
-function repairValidationContextNamesFile(
+function repairContextRequiresProgress(
   input: MigrationExecutorInput,
   files: readonly HarnessPromptFile[],
 ): boolean {
-  if (input.repairAttempt === 0 || input.previousAttempt?.failedChecks.length === 0) return false
+  const previousAttempt = input.previousAttempt
+  if (input.repairAttempt === 0 || previousAttempt === undefined
+    || previousAttempt.failedChecks.length === 0) return false
   const suppliedPaths = new Set(files.map(file => file.path))
-  return input.previousAttempt?.validationContext?.some(file => suppliedPaths.has(file.path)) === true
+  if (previousAttempt.validationContext !== undefined) {
+    return previousAttempt.validationContext.some(file => suppliedPaths.has(file.path))
+  }
+  // Some repository test failures do not name a source file. When this one
+  // context owns every writable model input, an empty response cannot repair
+  // any outstanding check, so reject it inside the attempt loop and spend the
+  // already-budgeted retry. Disjoint partial contexts may still abstain; their
+  // aggregate result is checked by requireRepairProgress after all settle.
+  const writablePaths = input.unresolvedFiles
+    .filter(file => !isPolicyReadOnly(input.impact, file.path))
+    .map(file => file.path)
+  return writablePaths.length > 0 && writablePaths.every(path => suppliedPaths.has(path))
 }
 
 function requireRepairProgress(
