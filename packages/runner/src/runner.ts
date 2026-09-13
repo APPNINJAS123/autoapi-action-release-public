@@ -263,9 +263,9 @@ export class ProposalRunner {
               : []
       const seededFiles = overlaySeedEdits(readableFiles, seedEdits)
       // The exact Dockershrink pointer adapter is a complete code-owned source
-      // edit, not a compatibility question for the hosted model. Omitting that
-      // one file from the request prevents a valid seed from being reformatted
-      // or redundantly returned while the Harness migrates the actual SDK calls.
+      // edit, and its existing AIService client holder is already compatible.
+      // Omit both from the request so the model can migrate only the three
+      // evidence-backed SDK call files instead of rewriting compatible plumbing.
       const unresolvedFiles = reviewedDockershrinkModelFiles(reviewedDockershrinkClient, seededFiles)
       if (candidateFiles.length > 0 && unresolvedFiles.length === 0) {
         return {

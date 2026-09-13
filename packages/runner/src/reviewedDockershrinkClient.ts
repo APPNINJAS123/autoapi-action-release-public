@@ -24,6 +24,10 @@ const MODEL_WRITABLE_AI_PATHS = [
   'internal/ai/optimize.go',
   'internal/ai/tools.go',
 ] as const
+const MODEL_OMITTED_COMPATIBLE_PATHS = new Set([
+  SOURCE_PATH,
+  'internal/ai/ai.go',
+])
 
 /**
  * Bind one mechanical pointer adapter to the exact reviewed Dockershrink job.
@@ -94,7 +98,7 @@ export function reviewedDockershrinkModelFiles<T extends { path: string }>(
   files: readonly T[],
 ): T[] {
   if (contract === undefined) return [...files]
-  return files.filter(file => file.path !== contract.sourcePath)
+  return files.filter(file => !MODEL_OMITTED_COMPATIBLE_PATHS.has(file.path))
 }
 
 /** Separate the exact code-owned adapter from cumulative model repair edits. */
