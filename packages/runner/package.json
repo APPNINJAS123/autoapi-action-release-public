@@ -1,0 +1,37 @@
+{
+  "name": "@automated-api/runner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "automated-api-proposal": "./dist/cli.js",
+    "automated-api-dependencies": "./dist/dependencyCli.js",
+    "automated-api-preparation": "./dist/preparationCli.js",
+    "automated-api-dependency-resolution": "./dist/dependencyResolutionCli.js",
+    "automated-api-gradle-wrapper-cache-key": "./dist/gradleWrapperCli.js",
+    "automated-api-toolchain-certification": "./dist/toolchainCertificationCli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --no-file-parallelism",
+    "test:coverage": "vitest run --coverage --no-file-parallelism"
+  },
+  "dependencies": {
+    "@automated-api/contracts": "workspace:*",
+    "@automated-api/remediation": "workspace:*",
+    "yaml": "2.9.0"
+  },
+  "devDependencies": {}
+}

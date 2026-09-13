@@ -1,0 +1,89 @@
+import java.util.Locale
+import org.gradle.api.artifacts.component.ModuleComponentIdentifier
+
+def requestedProjectsValue = System.getenv('AUTOAPI_GRADLE_PREFETCH_PROJECTS') ?: '*'
+def requestedProjects = requestedProjectsValue == '*'
+  ? null
+  : requestedProjectsValue.split(',').toList()
+def requestedTasksValue = System.getenv('AUTOAPI_GRADLE_PREFETCH_TASKS') ?: '*'
+def requestedTasks = requestedTasksValue == '*'
+  ? null
+  : requestedTasksValue.split(',').toList()
+def forcedModuleValue = gradle.startParameter.projectProperties['automatedApiForceModule']
+def forcedVersion = gradle.startParameter.projectProperties['automatedApiForceVersion']
+def forcedModule = forcedModuleValue?.split(':')?.toList()
+
+def isDynamicVersion = { version ->
+  version == '+' || version?.endsWith('.+') || version?.startsWith('latest.')
+    || version?.startsWith('[') || version?.startsWith('(')
+}
+
+def resolveExternalArtifacts = { targetProject ->
+  def candidates = targetProject.configurations.findAll { configuration ->
+    if (!configuration.canBeResolved) return false
+    def name = configuration.name.toLowerCase(Locale.ROOT)
+    name.contains('classpath') || name.contains('annotationprocessor')
+  }
+  candidates.each { configuration ->
+    def externalArtifacts = configuration.incoming.artifactView {
+      componentFilter { identifier -> identifier instanceof ModuleComponentIdentifier }
+    }.files
+    externalArtifacts.each { artifact ->
+      if (!artifact.isFile()) {
+        throw new GradleException("Resolved external artifact is missing: ${artifact}")
+      }
+    }
+  }
+}
+
+def materializeTaskInputs = { task ->
+  try {
+    task.inputs.files.files.each { input -> input.exists() }
+  } catch (GradleException error) {
+    if (!error.message?.startsWith('Cannot infer Groovy class path because no Groovy Jar was found')) {
+      throw error
+    }
+  }
+}
+
+if (requestedTasks != null) {
+  gradle.projectsEvaluated {
+    rootProject.tasks.register('autoApiPrefetchValidationDependencies') {
+      dependsOn(requestedTasks)
+    }
+  }
+  gradle.taskGraph.whenReady { graph ->
+    if (System.getenv('AUTOAPI_GRADLE_PREFETCH_TASK_GRAPH') == '1') {
+      def projectsByPath = [:]
+      graph.allTasks.each { task ->
+        projectsByPath[task.project.path] = task.project
+        // Reading the validation task inputs materializes lazy tool/runtime
+        // dependencies such as Gradle's inferred Groovy compiler classpath.
+        materializeTaskInputs(task)
+      }
+      projectsByPath.values().each(resolveExternalArtifacts)
+    }
+  }
+}
+
+allprojects {
+  if (forcedModule?.size() == 2 && forcedVersion) {
+    configurations.configureEach { configuration ->
+      configuration.resolutionStrategy.eachDependency { details ->
+        if (details.requested.group == forcedModule[0]
+          && details.requested.name == forcedModule[1]
+          && isDynamicVersion(details.requested.version)) {
+          details.useVersion(forcedVersion)
+          details.because('Automated API verified migration target')
+        }
+      }
+    }
+  }
+  if (requestedProjects != null && !requestedProjects.contains(project.path)) return
+  tasks.register('autoApiPrefetchDependencies') {
+    group = 'automated-api'
+    description = 'Materializes compile and runtime artifacts for later offline validation.'
+
+    doLast { resolveExternalArtifacts(project) }
+  }
+}

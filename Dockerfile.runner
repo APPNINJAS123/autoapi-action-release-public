@@ -1,0 +1,151 @@
+ARG AUTOAPI_PYTHON_IMAGE=python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7
+ARG AUTOAPI_ANALYSIS_PYTHON_IMAGE=python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7
+ARG AUTOAPI_RUST_IMAGE=rust:1.96.1-slim-bookworm@sha256:e18a79fc84dfcfc3ab5ba72290398a644c135c97eaa881447fddc354ee4701a3
+ARG AUTOAPI_GO_IMAGE=golang:1.26.5-bookworm@sha256:53eeac89074db483fdf0ab3be1df32bf6e47562263d2d0d6baa7f26acb4957dd
+ARG AUTOAPI_RUST_VERSION=1.96.1
+ARG AUTOAPI_JAVA_IMAGE=eclipse-temurin:21.0.8_9-jdk-jammy
+ARG AUTOAPI_DOTNET_IMAGE=mcr.microsoft.com/dotnet/sdk:9.0.304
+ARG AUTOAPI_PHP_IMAGE=php:8.4.11-cli-bookworm
+ARG AUTOAPI_COMPOSER_IMAGE=composer:2.8.10
+ARG AUTOAPI_RUBY_IMAGE=ruby:3.4.5-bookworm
+ARG AUTOAPI_BUNDLER_VERSION=2.6.9
+ARG AUTOAPI_SWIFT_IMAGE=swift:6.2.0-jammy
+ARG AUTOAPI_DART_IMAGE=dart:3.9.0
+ARG AUTOAPI_ELIXIR_IMAGE=hexpm/elixir:1.19.4-erlang-27.3.4.6-debian-bookworm-20251208-slim
+ARG AUTOAPI_CLOJURE_IMAGE=clojure:temurin-21-tools-deps-1.12.0.1530-bookworm-slim
+
+FROM ${AUTOAPI_PYTHON_IMAGE} AS python_toolchain
+RUN printf '%s\n' 'pip==25.0.1 --hash=sha256:c46efd13b6aa8279f33f2864459c8ce587ea6a1a59ee20de055868d8f7688f7f' > /tmp/pip-requirement.txt \
+    && python -m pip install --disable-pip-version-check --require-hashes --no-cache-dir --requirement /tmp/pip-requirement.txt \
+    && rm /tmp/pip-requirement.txt
+
+FROM ${AUTOAPI_ANALYSIS_PYTHON_IMAGE} AS python_analysis_runtime
+
+FROM ${AUTOAPI_RUST_IMAGE} AS rust_toolchain
+ARG AUTOAPI_RUST_VERSION
+RUN rustup component add --toolchain "${AUTOAPI_RUST_VERSION}-x86_64-unknown-linux-gnu" rustfmt clippy
+
+FROM ${AUTOAPI_GO_IMAGE} AS go_toolchain
+COPY packages/remediation/src/go/package_usage.go /opt/autoapi-build/package_usage.go
+RUN CGO_ENABLED=0 GO111MODULE=off GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local GOMAXPROCS=2 \
+    go build -trimpath -ldflags='-s -w' -o /usr/local/bin/autoapi-go-package-usage /opt/autoapi-build/package_usage.go
+FROM ${AUTOAPI_COMPOSER_IMAGE} AS composer_runtime
+
+FROM node:22-bookworm@sha256:673fce836d5a9185da33352682bfedb17c174d016370d08616748dff76fda862 AS analysis_runtime
+COPY --from=python_analysis_runtime /usr/local/ /usr/local/
+COPY --from=go_toolchain /usr/local/bin/autoapi-go-package-usage /usr/local/bin/autoapi-go-package-usage
+COPY scripts/lib/import-action-export.mjs /opt/autoapi-bootstrap/import-action-export.mjs
+
+# JavaScript and TypeScript migrations do not need the native compiler stack.
+# Keep their production image small enough to build within the persisted job
+# deadline even on a cold hosted runner.
+FROM analysis_runtime AS node_runtime
+
+FROM analysis_runtime AS python_runtime
+COPY --from=python_toolchain /usr/local/ /usr/local/
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONNOUSERSITE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Customer Cargo workspaces commonly select clang/lld in .cargo/config.toml.
+# Native dependency ports also need the standard C/C++ and autotools boundary.
+# Keep these tools in the trusted image so validation never installs packages.
+FROM analysis_runtime AS native_runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+      autoconf \
+      autoconf-archive \
+      automake \
+      bison \
+      build-essential \
+      ca-certificates \
+      clang \
+      cmake \
+      curl \
+      flex \
+      git \
+      lld \
+      libtool \
+      ninja-build \
+      pkg-config \
+      tar \
+      unzip \
+      zip \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM native_runtime AS rust_runtime
+COPY --from=rust_toolchain /usr/local/cargo/ /usr/local/cargo/
+COPY --from=rust_toolchain /usr/local/rustup/ /usr/local/rustup/
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# The pinned Node bookworm base already supplies GCC, libc headers and make for
+# CGO. Go does not need the separate Rust/C/C++ clang/CMake/LLVM download layer.
+FROM analysis_runtime AS go_runtime
+COPY --from=go_toolchain /usr/local/go/ /usr/local/go/
+ENV GOROOT=/usr/local/go \
+    PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+FROM native_runtime AS c_runtime
+
+FROM native_runtime AS cpp_runtime
+
+LABEL org.opencontainers.image.title="Automated API proposal runner"
+
+FROM ${AUTOAPI_JAVA_IMAGE} AS java_runtime
+
+FROM analysis_runtime AS jvm_runtime
+COPY --from=java_runtime /opt/java/openjdk/ /opt/java/openjdk/
+COPY packages/runner/src/gradle-dependency-prefetch.init.gradle /opt/autoapi-runtime/gradle-dependency-prefetch.init.gradle
+COPY packages/runner/dist/gradleWrapper.js packages/runner/dist/gradleWrapperCli.js /opt/autoapi-runtime/gradle-wrapper/
+ENV JAVA_HOME=/opt/java/openjdk \
+    PATH=/opt/java/openjdk/bin:/usr/local/bin:/usr/bin:/bin
+
+FROM ${AUTOAPI_DOTNET_IMAGE} AS dotnet_runtime
+COPY --from=analysis_runtime /usr/local/ /usr/local/
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+ENV DOTNET_NOLOGO=1 DOTNET_CLI_TELEMETRY_OPTOUT=1 NUGET_XMLDOC_MODE=skip PATH=/usr/local/bin:/usr/bin:/bin
+
+FROM ${AUTOAPI_PHP_IMAGE} AS php_runtime
+COPY --from=analysis_runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=analysis_runtime /usr/local/lib/node_modules/ /usr/local/lib/node_modules/
+COPY --from=composer_runtime /usr/bin/composer /usr/local/bin/composer
+RUN apt-get update && apt-get install -y --no-install-recommends git unzip libzip4 iputils-ping \
+    && docker-php-ext-install pcntl \
+    && rm -rf /var/lib/apt/lists/*
+ENV COMPOSER_ALLOW_SUPERUSER=1 COMPOSER_NO_INTERACTION=1 PATH=/usr/local/bin:/usr/bin:/bin
+
+FROM ${AUTOAPI_RUBY_IMAGE} AS ruby_runtime
+ARG AUTOAPI_BUNDLER_VERSION
+COPY --from=analysis_runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=analysis_runtime /usr/local/lib/node_modules/ /usr/local/lib/node_modules/
+RUN gem install bundler --version "${AUTOAPI_BUNDLER_VERSION}" --no-document
+ENV BUNDLE_DISABLE_SHARED_GEMS=true BUNDLE_SILENCE_ROOT_WARNING=1 PATH=/usr/local/bin:/usr/bin:/bin
+
+FROM ${AUTOAPI_SWIFT_IMAGE} AS swift_runtime
+COPY --from=analysis_runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=analysis_runtime /usr/local/lib/node_modules/ /usr/local/lib/node_modules/
+ENV PATH=/usr/local/swift/usr/bin:/usr/local/bin:/usr/bin:/bin
+
+FROM ${AUTOAPI_DART_IMAGE} AS dart_runtime
+COPY --from=analysis_runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=analysis_runtime /usr/local/lib/node_modules/ /usr/local/lib/node_modules/
+ENV PATH=/usr/lib/dart/bin:/usr/local/bin:/usr/bin:/bin
+
+FROM ${AUTOAPI_ELIXIR_IMAGE} AS elixir_runtime
+COPY --from=analysis_runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=analysis_runtime /usr/local/lib/node_modules/ /usr/local/lib/node_modules/
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git build-essential \
+    && rm -rf /var/lib/apt/lists/*
+ENV MIX_ENV=test \
+    MIX_HOME=/opt/dependency-cache/mix \
+    HEX_HOME=/opt/dependency-cache/hex \
+    PATH=/usr/local/bin:/usr/bin:/bin
+
+FROM ${AUTOAPI_CLOJURE_IMAGE} AS clojure_runtime
+COPY --from=analysis_runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=analysis_runtime /usr/local/lib/node_modules/ /usr/local/lib/node_modules/
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+ENV PATH="${JAVA_HOME}/bin:/usr/local/bin:/usr/bin:/bin"

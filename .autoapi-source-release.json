@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "1.0",
+  "sourceSha": "f2a19bfeeb18e377b0f3343468b0ca14464b67a7",
+  "sourceTreeSha": "796539984bf17244bc732e3f12e6699ab60119d7",
+  "generated": [
+    {
+      "path": "packages/runner/dist/gradleWrapper.js",
+      "sha256": "d3f121a83ab3a9206e808ed065891cf60dc91445bc49f4b1fbce6904f27d25c6"
+    },
+    {
+      "path": "packages/runner/dist/gradleWrapperCli.js",
+      "sha256": "4515e7ca0ada5a3ee38b4c5af127c6ce066e9d9fb9c332301d88f4dfcf309cbb"
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "name": "@automated-api/remediation",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/copy-static.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --no-file-parallelism",
+    "test:coverage": "vitest run --coverage --no-file-parallelism"
+  },
+  "dependencies": {
+    "@automated-api/contracts": "workspace:*",
+    "semver": "7.8.5",
+    "ts-morph": "25.0.1",
+    "zod": "3.24.1"
+  },
+  "devDependencies": {
+    "@types/semver": "7.8.0"
+  }
+}

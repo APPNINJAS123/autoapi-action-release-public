@@ -1,0 +1,1492 @@
+name: Automated API proposal runner
+description: Certify the repository's exact toolchain, then run the pinned proposal engine without network access
+inputs:
+  job-path:
+    description: Absolute path to the fetched migration job
+    required: true
+  job-sha256:
+    description: Expected SHA-256 of the migration job
+    required: true
+  output-directory:
+    description: Absolute directory for the proposal result
+    required: true
+  harness-result-path:
+    description: Optional path where a control-plane-issued Harness result exists or will be written
+    required: false
+    default: ''
+  control-plane-url:
+    description: Optional HTTPS control plane used to queue Harness while dependency preparation runs
+    required: false
+    default: ''
+  job-token:
+    description: Optional opaque job token paired with control-plane-url
+    required: false
+    default: ''
+  python-public-archive-cache-volume:
+    description: Optional dedicated autoapi-python-public-* Docker volume for untrusted public archive bytes only
+    required: false
+    default: ''
+outputs:
+  output-directory:
+    description: Proposal output directory
+    value: ${{ steps.run.outputs.output_directory }}
+runs:
+  using: composite
+  steps:
+    - id: run
+      name: Build trusted runner and execute offline
+      shell: bash
+      env:
+        JOB_PATH: ${{ inputs.job-path }}
+        JOB_SHA256: ${{ inputs.job-sha256 }}
+        OUTPUT_DIRECTORY: ${{ inputs.output-directory }}
+        HARNESS_RESULT_PATH: ${{ inputs.harness-result-path }}
+        CONTROL_PLANE_URL: ${{ inputs.control-plane-url }}
+        JOB_TOKEN: ${{ inputs.job-token }}
+        PYTHON_PUBLIC_ARCHIVE_CACHE_VOLUME: ${{ inputs.python-public-archive-cache-volume }}
+      run: |
+        set -euo pipefail
+        retry_network() {
+          local attempt=1
+          until "$@"; do
+            if [ "${attempt}" -ge 5 ]; then return 1; fi
+            sleep "$((attempt * 2))"
+            attempt="$((attempt + 1))"
+          done
+        }
+        test -f "${JOB_PATH}"
+        echo "${JOB_SHA256}  ${JOB_PATH}" | sha256sum -c -
+        job_deadline_seconds="$(node --input-type=module -e 'import fs from "node:fs"; const job=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); const deadline=Date.parse(job.deadlineAt); if(!Number.isFinite(deadline)){console.error("Migration job is missing a valid serialized deadlineAt");process.exit(2)} const remaining=deadline-Date.now()-5000; if(remaining<=0){console.error("Migration job deadline leaves no terminal-result persistence reserve");process.exit(2)} const bounded=Math.max(1,Math.floor(remaining)); process.stdout.write(`${Math.floor(bounded/1000)}.${String(bounded%1000).padStart(3,"0")}`)' "${JOB_PATH}")"
+        # The workflow's static 90-minute timeout is only a hard outer ceiling.
+        # Re-execute the complete composite step under the job's persisted
+        # remaining budget so image builds, dependency prefetch, the proposal,
+        # validation, and every retry share one absolute deadline.
+        case "$#" in
+          0) exec timeout --signal=TERM --kill-after=120s "${job_deadline_seconds}s" bash "$0" --autoapi-internal-deadline-guard ;;
+          1) [ "$1" = --autoapi-internal-deadline-guard ] || { echo "Invalid Action re-entry sentinel" >&2; exit 2; }; shift ;;
+          *) echo "Unexpected Action arguments" >&2; exit 2 ;;
+        esac
+        mkdir -p "${OUTPUT_DIRECTORY}"
+        harness_result_path="${HARNESS_RESULT_PATH}"
+        harness_wait_pid=""
+        final_runner_completed=0
+        python_builder_container=""
+        certification_manager_container=""
+        certification_verifier_container=""
+        harness_wait_error="${RUNNER_TEMP}/automated-api-harness-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.error"
+        harness_mount=()
+        cleanup_harness_waiter() {
+          if [ -n "${harness_wait_pid}" ] && kill -0 "${harness_wait_pid}" 2>/dev/null; then
+            kill "${harness_wait_pid}" 2>/dev/null || true
+            wait "${harness_wait_pid}" 2>/dev/null || true
+          fi
+          harness_wait_pid=""
+        }
+        persist_terminal_action_failure() {
+          local action_status="$1"
+          if [ "${action_status}" = 0 ]; then return 0; fi
+          ACTION_STATUS="${action_status}" TRUST_CURRENT_RESULT="${final_runner_completed}" OUTPUT_PATH="${OUTPUT_DIRECTORY}" QUARANTINE_PARENT="${RUNNER_TEMP}" RESULT_PATH="${OUTPUT_DIRECTORY}/result.json" PREPARATION_PATH="${OUTPUT_DIRECTORY}/preparation.json" node --input-type=module -e '
+            import fs from "node:fs";
+            import path from "node:path";
+            const maximumJsonBytes=1024*1024;
+            const terminal=new Set(["proposed","not_affected","blocked","manual","validation_failed","execution_failed"]);
+            const readOwnedJson=(file)=>{
+              let descriptor;
+              try{
+                descriptor=fs.openSync(file,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW|fs.constants.O_NONBLOCK);
+                const metadata=fs.fstatSync(descriptor);
+                if(!metadata.isFile()||metadata.nlink!==1||metadata.size>maximumJsonBytes)throw new Error("unsafe JSON input");
+                return JSON.parse(fs.readFileSync(descriptor,"utf8"));
+              }finally{if(descriptor!==undefined)fs.closeSync(descriptor)}
+            };
+            if(process.env.TRUST_CURRENT_RESULT==="1"){
+              let current;
+              try{current=readOwnedJson(process.env.RESULT_PATH)}catch{}
+              if(terminal.has(current?.status))process.exit(0);
+            }
+            let stage="workflow";
+            try{if(readOwnedJson(process.env.PREPARATION_PATH).status==="prepare_dependencies")stage="prepare_dependencies"}catch{}
+            const status=Number(process.env.ACTION_STATUS);
+            const rawRunId=process.env.GITHUB_RUN_ID??"";
+            const result={status:"execution_failed",failureCode:"github_actions_step_failed",failureKind:"infrastructure",failureReason:[124,137,143].includes(status)?"timeout":"process_failure",stage,phase:"workflow",runId:/^\d+$/.test(rawRunId)?rawRunId:"0",runAttempt:Number(process.env.GITHUB_RUN_ATTEMPT??"1")};
+            const outputMetadata=fs.lstatSync(process.env.OUTPUT_PATH);
+            if(!outputMetadata.isDirectory()||outputMetadata.isSymbolicLink())throw new Error("unsafe output directory");
+            let quarantineDirectory;
+            for(const name of ["result.json","result.json.part","manifest.json","manifest.json.part","proposal.patch","proposal.patch.part"]){
+              const candidate=path.join(process.env.OUTPUT_PATH,name);
+              let metadata;
+              try{metadata=fs.lstatSync(candidate)}catch(error){if(error?.code==="ENOENT")continue;throw error}
+              if(metadata.isDirectory()&&!metadata.isSymbolicLink()){
+                if(quarantineDirectory===undefined){
+                  const parentMetadata=fs.lstatSync(process.env.QUARANTINE_PARENT);
+                  if(!parentMetadata.isDirectory()||parentMetadata.isSymbolicLink())throw new Error("unsafe quarantine parent");
+                  quarantineDirectory=fs.mkdtempSync(path.join(process.env.QUARANTINE_PARENT,"automated-api-output-quarantine-"));
+                  fs.chmodSync(quarantineDirectory,0o700);
+                }
+                fs.renameSync(candidate,path.join(quarantineDirectory,name));
+              }else fs.unlinkSync(candidate);
+            }
+            const stagingDirectory=fs.mkdtempSync(path.join(process.env.OUTPUT_PATH,".terminal-result-"));
+            try{
+              const staged=path.join(stagingDirectory,"result.json");
+              const descriptor=fs.openSync(staged,"wx",0o600);
+              try{fs.writeFileSync(descriptor,`${JSON.stringify(result,null,2)}\n`,"utf8");fs.fsyncSync(descriptor)}finally{fs.closeSync(descriptor)}
+              fs.renameSync(staged,process.env.RESULT_PATH);
+              const published=fs.lstatSync(process.env.RESULT_PATH);
+              if(!published.isFile()||published.isSymbolicLink()||published.nlink!==1||(published.mode&0o777)!==0o600)throw new Error("unsafe terminal result publication");
+            }finally{fs.rmSync(stagingDirectory,{recursive:true,force:true})}
+          ' || true
+        }
+        remove_preliminary_runner_result() {
+          EXPECTED_STATUS="${analysis_result_status}" RESULT_PATH="${OUTPUT_DIRECTORY}/result.json" node --input-type=module -e '
+            import fs from "node:fs";
+            let descriptor;
+            try{
+              descriptor=fs.openSync(process.env.RESULT_PATH,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW|fs.constants.O_NONBLOCK);
+              const metadata=fs.fstatSync(descriptor);
+              if(!metadata.isFile()||metadata.nlink!==1||metadata.size>1024*1024)throw new Error("unsafe preliminary result");
+              const result=JSON.parse(fs.readFileSync(descriptor,"utf8"));
+              if(result.status!==process.env.EXPECTED_STATUS)throw new Error("unexpected preliminary result");
+            }finally{if(descriptor!==undefined)fs.closeSync(descriptor)}
+            fs.unlinkSync(process.env.RESULT_PATH);
+          '
+        }
+        cleanup_action() {
+          local action_status="$?"
+          trap - EXIT TERM INT
+          persist_terminal_action_failure "${action_status}"
+          cleanup_harness_waiter
+          if [ -n "${python_builder_container}" ]; then docker rm -f "${python_builder_container}" >/dev/null 2>&1 || true; fi
+          if [ -n "${certification_manager_container}" ]; then docker rm -f "${certification_manager_container}" >/dev/null 2>&1 || true; fi
+          if [ -n "${certification_verifier_container}" ]; then docker rm -f "${certification_verifier_container}" >/dev/null 2>&1 || true; fi
+          exit "${action_status}"
+        }
+        trap cleanup_action EXIT
+        trap 'exit 143' TERM
+        trap 'exit 130' INT
+        job_deadline_at="$(node --input-type=module -e 'import fs from "node:fs"; const job=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); const deadline=Date.parse(job.deadlineAt); if(!Number.isFinite(deadline))process.exit(2); process.stdout.write(job.deadlineAt)' "${JOB_PATH}")"
+        wait_for_harness_result() {
+          while [ ! -s "${harness_result_path}" ]; do
+            if [ -s "${harness_wait_error}" ]; then cat "${harness_wait_error}" >&2; return 1; fi
+            node --input-type=module -e 'const deadline=Date.parse(process.argv[1]); if(!Number.isFinite(deadline)||Date.now()>=deadline)process.exit(1)' "${job_deadline_at}" || {
+              printf '%s\n' 'Harness result was not persisted before the job deadline' > "${harness_wait_error}"
+              cat "${harness_wait_error}" >&2
+              return 1
+            }
+            sleep 2
+          done
+        }
+        poll_harness_result() {
+          local response="${harness_result_path}.part"
+          rm -f "${response}" "${harness_wait_error}"
+          while node --input-type=module -e 'const deadline=Date.parse(process.argv[1]); process.exit(Number.isFinite(deadline)&&Date.now()<deadline?0:1)' "${job_deadline_at}"; do
+            local http_status=""
+            if http_status="$(curl --silent --show-error --max-time 10 --output "${response}" --write-out '%{http_code}' --header "Authorization: Bearer ${JOB_TOKEN}" "${CONTROL_PLANE_URL%/}/internal/migration-jobs/${job_id}/harness-result")"; then
+              case "${http_status}" in
+                200) mv "${response}" "${harness_result_path}"; return 0 ;;
+                202|429|502|503|504) ;;
+                *) mv "${response}" "${harness_wait_error}"; return 1 ;;
+              esac
+            fi
+            sleep 2
+          done
+          printf '%s\n' 'Harness result was not persisted before the job deadline' > "${harness_wait_error}"
+          return 1
+        }
+        start_harness_concurrently() {
+          if [ -n "${harness_result_path}" ]; then return 0; fi
+          test -n "${CONTROL_PLANE_URL}" && test -n "${JOB_TOKEN}"
+          case "${CONTROL_PLANE_URL}" in https://*) ;; *) echo "Control plane URL must use HTTPS" >&2; return 2;; esac
+          job_id="$(node --input-type=module -e 'import fs from "node:fs"; const job=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); process.stdout.write(job.id)' "${JOB_PATH}")"
+          local request="${RUNNER_TEMP}/automated-api-harness-request-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          local queue_response="${RUNNER_TEMP}/automated-api-harness-queue-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          RESULT="${OUTPUT_DIRECTORY}/result.json" REQUEST="${request}" node --input-type=module -e 'import fs from "node:fs"; const result=JSON.parse(fs.readFileSync(process.env.RESULT,"utf8")); if(result.status!=="harness_required")process.exit(2); fs.writeFileSync(process.env.REQUEST,JSON.stringify({result}))'
+          curl --fail --silent --show-error --max-time 30 --request POST --header "Authorization: Bearer ${JOB_TOKEN}" --header "Content-Type: application/json" --data-binary "@${request}" "${CONTROL_PLANE_URL%/}/internal/migration-jobs/${job_id}/proposal" --output "${queue_response}"
+          JOB_DEADLINE_AT="${job_deadline_at}" QUEUE_RESPONSE="${queue_response}" node --input-type=module -e 'import fs from "node:fs"; const value=JSON.parse(fs.readFileSync(process.env.QUEUE_RESPONSE,"utf8")); if(value.harnessDeadlineAt!==process.env.JOB_DEADLINE_AT){console.error("Harness queue changed the persisted job deadline");process.exit(2)}'
+          harness_result_path="${RUNNER_TEMP}/automated-api-harness-result-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          poll_harness_result &
+          harness_wait_pid="$!"
+        }
+
+        runner_source="$(mktemp -d "${RUNNER_TEMP}/automated-api-runner-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXX")"
+        cp -R "${GITHUB_ACTION_PATH}/." "${runner_source}/"
+        corepack enable
+        retry_network corepack install --global pnpm@11.19.0
+        # Run product tooling from the trusted Action root. Corepack otherwise
+        # reads the customer checkout's packageManager and correctly refuses
+        # to launch the Action's own pnpm when that customer uses npm or Yarn.
+        (
+          cd "${runner_source}"
+          retry_network corepack pnpm install --frozen-lockfile --no-optional
+          corepack pnpm build
+        )
+
+        analysis_image="automated-api-analysis:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        analysis_runtime_ref="node:22-bookworm@sha256:673fce836d5a9185da33352682bfedb17c174d016370d08616748dff76fda862"
+        retry_network docker build --pull --platform linux/amd64 \
+          --target analysis_runtime \
+          --file "${runner_source}/Dockerfile.runner" \
+          --tag "${analysis_image}" "${runner_source}"
+        analysis_image_id="$(docker image inspect --format '{{.Id}}' "${analysis_image}")"
+        case "${analysis_image_id}" in sha256:????????????????????????????????????????????????????????????????) ;; *) echo "Invalid analysis image id" >&2; exit 2;; esac
+        # CUSTOMER_SOURCE_RAW_INTEGRITY_CAPTURE_BEGIN
+        # Snapshot the complete customer workspace as raw bytes, node kinds and
+        # executable modes before any package-manager work. The verifier never
+        # consults Git config, attributes or the index, and its manifest lives
+        # under the trusted Action source rather than in the customer checkout.
+        customer_source_manifest=/opt/automated-api/.autoapi-customer-source.json
+        customer_source_tree="$(env -i PATH=/usr/bin:/bin GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+          GIT_NO_REPLACE_OBJECTS=1 /usr/bin/git -C "${GITHUB_WORKSPACE}" rev-parse HEAD^{tree})"
+        docker run --rm --network none --user "$(id -u):$(id -g)" \
+          --read-only --cap-drop ALL --security-opt no-new-privileges \
+          --mount "type=bind,src=${GITHUB_WORKSPACE},dst=/workspace,readonly" \
+          --mount "type=bind,src=${runner_source},dst=/opt/automated-api" \
+          "${analysis_image}" /usr/local/bin/node \
+            /opt/automated-api/scripts/lib/verify-exact-worktree.mjs capture \
+            /workspace "${customer_source_tree}" "${customer_source_manifest}"
+        # CUSTOMER_SOURCE_RAW_INTEGRITY_CAPTURE_END
+
+        # Analyze first in the same network-disabled image used by the full
+        # proposal. The repository is read-only and customer code is parsed,
+        # never imported or executed. A conclusive no-op must not be turned
+        # into a package-install failure by an unrelated dependency conflict.
+        preparation_status="$(docker run --rm --network none --user "$(id -u):$(id -g)" \
+          --mount "type=bind,src=${runner_source},dst=/opt/automated-api,readonly" \
+          --mount "type=bind,src=${GITHUB_WORKSPACE},dst=/workspace,readonly" \
+          --mount "type=bind,src=${JOB_PATH},dst=/input/job.json,readonly" \
+          --mount "type=bind,src=${OUTPUT_DIRECTORY},dst=/output" \
+          --workdir /workspace \
+          --env "HOME=/tmp/automated-api-home" \
+          --env "AUTOMATED_API_PYTHON=/usr/local/bin/python" \
+          --env "PATH=/opt/automated-api/node_modules/.bin:/usr/local/bin:/usr/bin:/bin" \
+          "${analysis_image}" \
+          sh -c 'mkdir -p "$HOME"; exec node /opt/automated-api/packages/runner/dist/preparationCli.js /input/job.json /workspace /output')"
+        case "${preparation_status}" in
+          not_affected|blocked)
+            test -f "${OUTPUT_DIRECTORY}/result.json"
+            docker run --rm --network none --user "$(id -u):$(id -g)" \
+              --mount "type=bind,src=${runner_source},dst=/opt/automated-api,readonly" \
+              --mount "type=bind,src=${GITHUB_WORKSPACE},dst=/workspace,readonly" \
+              --mount "type=bind,src=${JOB_PATH},dst=/input/job.json,readonly" \
+              --mount "type=bind,src=${OUTPUT_DIRECTORY},dst=/output" \
+              --workdir /workspace \
+              --env "MANAGER_NAME=none" \
+              --env "MANAGER_VERSION=1.0.0" \
+              --env "MANAGER_SPEC=none@1.0.0" \
+              --env "MANAGER_VARIANT=analysis-only" \
+              --env "MANAGER_LOCKFILE=." \
+              --env "RUNNER_IMAGE_ID=${analysis_image_id}" \
+              --env "RUNTIME_IMAGES_JSON=[\"${analysis_runtime_ref}\"]" \
+              --env "PATH=/opt/automated-api/node_modules/.bin:/usr/local/bin:/usr/bin:/bin" \
+              "${analysis_image}" \
+              node /opt/automated-api/packages/runner/dist/toolchainCertificationCli.js \
+                /input/job.json /workspace /output/toolchain-certification.json
+            echo "output_directory=${OUTPUT_DIRECTORY}" >> "${GITHUB_OUTPUT}"
+            exit 0 ;;
+          prepare_dependencies) ;;
+          *) echo "Unsupported preparation result: ${preparation_status}" >&2; exit 2 ;;
+        esac
+        preparation_impact_outcome="$(OUTPUT="${OUTPUT_DIRECTORY}" node --input-type=module -e 'import fs from "node:fs"; import path from "node:path"; process.stdout.write(JSON.parse(fs.readFileSync(path.join(process.env.OUTPUT,"preparation.json"),"utf8")).impact.outcome)')"
+        defer_preliminary_proposal="$(OUTPUT="${OUTPUT_DIRECTORY}" node --input-type=module -e 'import fs from "node:fs"; import path from "node:path"; process.stdout.write(JSON.parse(fs.readFileSync(path.join(process.env.OUTPUT,"preparation.json"),"utf8")).deferPreliminaryProposal === true ? "1" : "0")')"
+        # Dart ownership needs its pinned SDK and certified original pub graph.
+        # The generic analysis image has neither: let the final offline runtime
+        # emit the first request, then use the normal Harness handoff/re-entry.
+        dart_analysis_deferred="$(node -e 'const job=require(process.argv[1]);process.stdout.write((job.repository.packageManager?.startsWith("dart@") || job.changeEvent.affectedLanguages.includes("dart")) ? "1" : "0")' "${JOB_PATH}")"
+        analysis_result_status=""
+        if [ "${preparation_impact_outcome}" = affected_manual ] && [ "${dart_analysis_deferred}" != 1 ] && [ "${defer_preliminary_proposal}" != 1 ]; then
+          docker run --rm --network none --user "$(id -u):$(id -g)" \
+            --mount "type=bind,src=${runner_source},dst=/opt/automated-api,readonly" \
+            --mount "type=bind,src=${GITHUB_WORKSPACE},dst=/workspace,readonly" \
+            --mount "type=bind,src=${JOB_PATH},dst=/input/job.json,readonly" \
+            --mount "type=bind,src=${OUTPUT_DIRECTORY},dst=/output" \
+            --workdir /workspace \
+            --env "HOME=/tmp/automated-api-home" \
+            --env "AUTOMATED_API_PYTHON=/usr/local/bin/python" \
+            --env "PATH=/opt/automated-api/node_modules/.bin:/usr/local/bin:/usr/bin:/bin" \
+            "${analysis_image}" \
+            sh -c 'mkdir -p "$HOME"; exec node /opt/automated-api/packages/runner/dist/cli.js /input/job.json /workspace /output'
+          analysis_result_status="$(OUTPUT="${OUTPUT_DIRECTORY}" node --input-type=module -e 'import fs from "node:fs"; import path from "node:path"; process.stdout.write(JSON.parse(fs.readFileSync(path.join(process.env.OUTPUT,"result.json"),"utf8")).status)')"
+          if [ "${analysis_result_status}" = harness_required ]; then start_harness_concurrently; fi
+        fi
+
+        # The networked stage performs only the customer's frozen/immutable
+        # install in a disposable archive, with lifecycle scripts disabled.
+        # Migration dependencies come from a separate clean, code-owned
+        # manifest rather than provider text, model output, or arbitrary
+        # customer input. A second disposable archive receives the reviewed
+        # manifest edit so pnpm can cache every registry metadata record needed
+        # by the future offline lockfile refresh. The real checkout is never
+        # mounted into a network-enabled customer package-manager container.
+        customer_source="$(mktemp -d "${RUNNER_TEMP}/automated-api-customer-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXX")"
+        certification_source="$(mktemp -d "${RUNNER_TEMP}/automated-api-certification-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXX")"
+        dependency_source="$(mktemp -d "${RUNNER_TEMP}/automated-api-dependencies-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXX")"
+        resolution_source="$(mktemp -d "${RUNNER_TEMP}/automated-api-resolution-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXX")"
+        dependency_cache="$(mktemp -d "${RUNNER_TEMP}/automated-api-cache-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXX")"
+        python_certified_cache="$(mktemp -d "${RUNNER_TEMP}/automated-api-python-certified-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXX")"
+        dependency_home="$(mktemp -d "${RUNNER_TEMP}/automated-api-home-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXX")"
+        mkdir -p "${customer_source}" "${certification_source}" "${dependency_source}" "${resolution_source}" "${dependency_cache}" "${python_certified_cache}" "${dependency_home}"
+        certification_runtime_uid="$(id -u)"
+        certification_runtime_gid="$(id -g)"
+        if [ "${certification_runtime_uid}" = 0 ]; then
+          certification_runtime_uid=65532
+          certification_runtime_gid=65532
+        fi
+        IFS=$'\x1f' read -r manager_name manager_version manager_variant manager_lockfile manager_spec manager_directory manager_manifest python_version runtime_version scala_version coursier_version erlang_version hex_version hex_archive_url hex_archive_sha512 rebar3_version rebar3_archive_url rebar3_archive_sha512 gradle_prefetch_projects gradle_prefetch_tasks \
+          < <(docker run --rm --network none --user "$(id -u):$(id -g)" \
+            --mount "type=bind,src=${runner_source},dst=/opt/automated-api,readonly" \
+            --mount "type=bind,src=${GITHUB_WORKSPACE},dst=/workspace,readonly" \
+            --mount "type=bind,src=${JOB_PATH},dst=/input/job.json,readonly" \
+            --mount "type=bind,src=${dependency_source},dst=/opt/dependency-source" \
+            --workdir /workspace \
+            "${analysis_image}" \
+            node /opt/automated-api/packages/runner/dist/dependencyCli.js \
+              /input/job.json /workspace /opt/dependency-source)
+        test -n "${manager_name}"
+        test -n "${manager_version}"
+        test -n "${manager_variant}"
+        test -n "${manager_lockfile}"
+        test -n "${manager_spec}"
+        test -n "${manager_directory}"
+        test -n "${manager_manifest}"
+        python_image="python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7"
+        rust_image="rust:1.96.1-slim-bookworm@sha256:e18a79fc84dfcfc3ab5ba72290398a644c135c97eaa881447fddc354ee4701a3"
+        go_image="golang:1.26.5-bookworm@sha256:53eeac89074db483fdf0ab3be1df32bf6e47562263d2d0d6baa7f26acb4957dd"
+        java_image="eclipse-temurin:21.0.8_9-jdk-jammy"
+        dotnet_image="mcr.microsoft.com/dotnet/sdk:9.0.304"
+        php_image="php:8.4.11-cli-bookworm"
+        composer_image="composer:2.8.10"
+        ruby_image="ruby:3.4.5-bookworm"
+        swift_image="swift:6.2.0-jammy"
+        dart_image="dart:3.9.0"
+        elixir_image="hexpm/elixir:1.19.4-erlang-27.3.4.6-debian-bookworm-20251208-slim"
+        clojure_image="clojure:temurin-21-tools-deps-1.12.0.1530-bookworm-slim"
+        bundler_version=2.6.9
+        rust_version=1.96.1
+        manager_runtime_target=node_runtime
+        manager_runtime_images=("${analysis_runtime_ref}")
+        resolve_runtime_image() {
+          local tag="$1"
+          retry_network docker pull --platform linux/amd64 "${tag}" > /dev/null
+          local digest
+          digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "${tag}")"
+          case "${digest}" in *@sha256:????????????????????????????????????????????????????????????????) ;; *) return 1;; esac
+          printf '%s' "${digest}"
+        }
+        case "${manager_variant}" in
+          python-pip|python-uv|python-stdlib)
+            manager_runtime_target=python_runtime
+            requested_python_version="${python_version}"
+            case "${requested_python_version}" in
+              [0-9]*.[0-9]*)
+                case "${requested_python_version}" in
+                  *.*.*)
+                    if [ "${requested_python_version}" != 3.12.11 ]; then
+                      python_image="$(resolve_runtime_image "python:${requested_python_version}-slim-bookworm")"
+                    fi ;;
+                  *.*)
+                    # Minor-only declarations such as 3.13 are compatibility
+                    # requirements, not executable versions. Resolve the
+                    # official minor tag once, pin its immutable digest, and
+                    # record the concrete interpreter found inside it.
+                    python_image="$(resolve_runtime_image "python:${requested_python_version}-slim-bookworm")"
+                    python_version="$(docker run --rm --network none --platform linux/amd64 "${python_image}" \
+                    python --version 2>&1 | grep -oE '[0-9]+([.][0-9]+){2}' | head -1)"
+                    case "${python_version}" in
+                      "${requested_python_version}".*) ;;
+                      *) echo "Resolved Python does not satisfy ${requested_python_version}" >&2; exit 2 ;;
+                    esac ;;
+                  *) echo "Unsupported Python runtime requirement ${requested_python_version}" >&2; exit 2 ;;
+                esac ;;
+              *) echo "Unsupported Python runtime requirement ${requested_python_version}" >&2; exit 2 ;;
+            esac
+
+            # Recreate the code-owned dependency manifest with the concrete
+            # interpreter version. The repository declaration remains
+            # untouched; only this job receives the resolved version.
+            IFS=$'\x1f' read -r manager_name manager_version manager_variant manager_lockfile manager_spec manager_directory manager_manifest python_version runtime_version scala_version coursier_version erlang_version hex_version hex_archive_url hex_archive_sha512 rebar3_version rebar3_archive_url rebar3_archive_sha512 gradle_prefetch_projects gradle_prefetch_tasks \
+              < <(docker run --rm --network none --user "$(id -u):$(id -g)" \
+                --mount "type=bind,src=${runner_source},dst=/opt/automated-api,readonly" \
+                --mount "type=bind,src=${GITHUB_WORKSPACE},dst=/workspace,readonly" \
+                --mount "type=bind,src=${JOB_PATH},dst=/input/job.json,readonly" \
+                --mount "type=bind,src=${dependency_source},dst=/opt/dependency-source" \
+                --workdir /workspace \
+                --env "AUTOMATED_API_RESOLVED_PYTHON_VERSION=${python_version}" \
+                "${analysis_image}" \
+                node /opt/automated-api/packages/runner/dist/dependencyCli.js \
+                  /input/job.json /workspace /opt/dependency-source)
+            case "${python_version}" in "${requested_python_version}".*|"${requested_python_version}") ;; *) exit 2;; esac
+            manager_runtime_images=("${python_image}") ;;
+          rust-cargo)
+            manager_runtime_target=rust_runtime
+            rust_version="${manager_version}"
+            if [ "${manager_version}" != 1.96.1 ]; then
+              rust_image="$(resolve_runtime_image "rust:${manager_version}-slim-bookworm")"
+            fi
+            manager_runtime_images=("${rust_image}") ;;
+          go-modules)
+            manager_runtime_target=go_runtime
+            if [ "${manager_version}" != 1.26.5 ]; then
+              go_image="$(resolve_runtime_image "golang:${manager_version}-bookworm")"
+            fi
+            manager_runtime_images=("${go_image}") ;;
+          jvm-maven|jvm-gradle|scala-sbt)
+            requested_java_version="${runtime_version}"
+            case "${requested_java_version}" in
+              21.0.8) java_image="$(resolve_runtime_image "eclipse-temurin:${requested_java_version}_9-jdk-jammy")" ;;
+              17.0.12) java_image="$(resolve_runtime_image "eclipse-temurin:${requested_java_version}_7-jdk-jammy")" ;;
+              [0-9]*)
+                java_runtime_tag="eclipse-temurin:${requested_java_version}-jdk-jammy"
+                if [ "${requested_java_version}" = 11.0.28 ]; then
+                  java_runtime_tag='eclipse-temurin:11.0.28_6-jdk-jammy'
+                fi
+                java_image="$(resolve_runtime_image "${java_runtime_tag}")"
+                java_version="$(docker run --rm --network none --platform linux/amd64 "${java_image}" \
+                  java -version 2>&1 | grep -oE '[0-9]+([.][0-9]+){2}' | head -1)"
+                case "${java_version}" in "${requested_java_version}"|"${requested_java_version}".*) ;; *) echo "Resolved Java does not satisfy ${requested_java_version}" >&2; exit 2;; esac ;;
+              *) echo "Unsupported Java runtime ${requested_java_version}" >&2; exit 2 ;;
+            esac
+            manager_runtime_target=jvm_runtime
+            manager_runtime_images=("${java_image}") ;;
+          dotnet-nuget)
+            dotnet_image="$(resolve_runtime_image "mcr.microsoft.com/dotnet/sdk:${manager_version}")"
+            manager_runtime_target=dotnet_runtime
+            manager_runtime_images=("${dotnet_image}") ;;
+          php-composer)
+            php_distribution=bookworm
+            case "${runtime_version}" in
+              7.*|8.0.*) php_distribution=bullseye ;;
+            esac
+            php_image="$(resolve_runtime_image "php:${runtime_version}-cli-${php_distribution}")"
+            composer_image="$(resolve_runtime_image "composer:${manager_version}")"
+            manager_runtime_target=php_runtime
+            manager_runtime_images=("${php_image}" "${composer_image}") ;;
+          ruby-bundler)
+            ruby_image="$(resolve_runtime_image "ruby:${runtime_version}-bookworm")"
+            bundler_version="${manager_version}"
+            manager_runtime_target=ruby_runtime
+            manager_runtime_images=("${ruby_image}") ;;
+          swift-package)
+            swift_image="$(resolve_runtime_image "swift:${manager_version}-jammy")"
+            manager_runtime_target=swift_runtime
+            manager_runtime_images=("${swift_image}") ;;
+          dart-pub)
+            dart_image="$(resolve_runtime_image "dart:${manager_version}")"
+            manager_runtime_target=dart_runtime
+            manager_runtime_images=("${dart_image}") ;;
+          elixir-mix)
+            test -n "${hex_version}"; test -n "${hex_archive_url}"; test -n "${hex_archive_sha512}"
+            test -n "${rebar3_version}"; test -n "${rebar3_archive_url}"; test -n "${rebar3_archive_sha512}"
+            case "${runtime_version}:${erlang_version}" in
+              1.19.4:27.3.4.6)
+                elixir_image="$(resolve_runtime_image "hexpm/elixir:1.19.4-erlang-27.3.4.6-debian-bookworm-20251208-slim")" ;;
+              *) echo "Unsupported certified Elixir/OTP runtime ${runtime_version}/${erlang_version}" >&2; exit 2 ;;
+            esac
+            manager_runtime_target=elixir_runtime
+            manager_runtime_images=("${elixir_image}") ;;
+          clojure-tools-deps)
+            clojure_image="$(resolve_runtime_image "clojure:temurin-21-tools-deps-${manager_version}-bookworm-slim")"
+            manager_runtime_target=clojure_runtime
+            manager_runtime_images=("${clojure_image}") ;;
+          clojure-leiningen)
+            clojure_image="$(resolve_runtime_image "clojure:temurin-21-lein-${manager_version}-bookworm-slim")"
+            manager_runtime_target=clojure_runtime
+            manager_runtime_images=("${clojure_image}") ;;
+          c-vcpkg)
+            test "${manager_version}" = 1004d5d0f80ac648514e3e6ce8e033f44b45e246
+            manager_runtime_target=c_runtime
+            manager_runtime_images=("${analysis_runtime_ref}") ;;
+          cpp-vcpkg)
+            test "${manager_version}" = cea592f4772491abdb7c483387a59ea89889f4be
+            manager_runtime_target=cpp_runtime
+            manager_runtime_images=("${analysis_runtime_ref}") ;;
+        esac
+        runtime_images_json="$(node -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)))' "${manager_runtime_images[@]}")"
+        runner_image="automated-api-runner:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        retry_network docker build --pull --platform linux/amd64 \
+          --target "${manager_runtime_target}" \
+          --build-arg "AUTOAPI_PYTHON_IMAGE=${python_image}" \
+          --build-arg "AUTOAPI_RUST_IMAGE=${rust_image}" \
+          --build-arg "AUTOAPI_RUST_VERSION=${rust_version}" \
+          --build-arg "AUTOAPI_GO_IMAGE=${go_image}" \
+          --build-arg "AUTOAPI_JAVA_IMAGE=${java_image}" \
+          --build-arg "AUTOAPI_DOTNET_IMAGE=${dotnet_image}" \
+          --build-arg "AUTOAPI_PHP_IMAGE=${php_image}" \
+          --build-arg "AUTOAPI_COMPOSER_IMAGE=${composer_image}" \
+          --build-arg "AUTOAPI_RUBY_IMAGE=${ruby_image}" \
+          --build-arg "AUTOAPI_BUNDLER_VERSION=${bundler_version}" \
+          --build-arg "AUTOAPI_SWIFT_IMAGE=${swift_image}" \
+          --build-arg "AUTOAPI_DART_IMAGE=${dart_image}" \
+          --build-arg "AUTOAPI_ELIXIR_IMAGE=${elixir_image}" \
+          --build-arg "AUTOAPI_CLOJURE_IMAGE=${clojure_image}" \
+          --file "${runner_source}/Dockerfile.runner" \
+          --tag "${runner_image}" "${runner_source}"
+        runner_image_id="$(docker image inspect --format '{{.Id}}' "${runner_image}")"
+        case "${runner_image_id}" in sha256:????????????????????????????????????????????????????????????????) ;; *) echo "Invalid runner image id" >&2; exit 2;; esac
+        manager_workdir="/workspace/${manager_directory}"
+        resolution_workdir="/opt/dependency-resolution/${manager_directory}"
+        composer_root_version=""
+        if [ "${manager_variant}" = php-composer ]; then
+          composer_root_json="$(docker run --rm --network none \
+            --mount "type=bind,src=${GITHUB_WORKSPACE},dst=/workspace,readonly" \
+            --workdir "${manager_workdir}" \
+            --env HOME=/tmp \
+            --env COMPOSER_VENDOR_DIR=/tmp/vendor \
+            "${runner_image}" \
+            sh -c 'git config --global --add safe.directory /workspace && exec composer show --self --format=json --no-ansi --no-plugins --no-scripts')"
+          composer_root_version="$(node -e 'const value=JSON.parse(process.argv[1]); process.stdout.write(value.versions?.[0] ?? "")' "${composer_root_json}")"
+          test -n "${composer_root_version}"
+        fi
+        git -C "${GITHUB_WORKSPACE}" archive --format=tar HEAD | tar -xf - -C "${customer_source}"
+        # CERTIFICATION_SOURCE_MATERIALIZATION_BEGIN. Clone without checkout so
+        # neither ambient Git configuration nor repository attributes can run
+        # filters or rewrite bytes. A network-disabled, code-owned materializer
+        # writes raw Git blobs, symlinks and executable modes, then records the
+        # exact tree state in the runner source mounted read-only below.
+        certification_head="$(env -i PATH=/usr/bin:/bin GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+          GIT_NO_REPLACE_OBJECTS=1 /usr/bin/git -C "${GITHUB_WORKSPACE}" rev-parse HEAD)"
+        certification_tree="$(env -i PATH=/usr/bin:/bin GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+          GIT_NO_REPLACE_OBJECTS=1 /usr/bin/git -C "${GITHUB_WORKSPACE}" rev-parse HEAD^{tree})"
+        env -i HOME=/tmp PATH=/usr/bin:/bin GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+          GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 \
+          /usr/bin/git clone --quiet --no-local --no-hardlinks --no-recurse-submodules --no-checkout \
+            "${GITHUB_WORKSPACE}" "${certification_source}"
+        env -i HOME=/tmp PATH=/usr/bin:/bin GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+          GIT_NO_REPLACE_OBJECTS=1 /usr/bin/git -C "${certification_source}" \
+          update-ref --no-deref HEAD "${certification_head}"
+        certification_manifest="${runner_source}/.autoapi-certification-source.json"
+        docker run --rm --network none --user 0:0 \
+          --mount "type=bind,src=${runner_source},dst=/opt/automated-api" \
+          --mount "type=bind,src=${certification_source},dst=/workspace" \
+          --env "CERTIFICATION_RUNTIME_UID=${certification_runtime_uid}" \
+          --env "CERTIFICATION_RUNTIME_GID=${certification_runtime_gid}" \
+          "${runner_image}" sh -c 'chown -R "$CERTIFICATION_RUNTIME_UID:$CERTIFICATION_RUNTIME_GID" /opt/automated-api /workspace'
+        docker run --rm --network none --user "${certification_runtime_uid}:${certification_runtime_gid}" \
+          --mount "type=bind,src=${runner_source},dst=/opt/automated-api" \
+          --mount "type=bind,src=${certification_source},dst=/workspace" \
+          "${runner_image}" /usr/local/bin/node /opt/automated-api/scripts/lib/verify-exact-worktree.mjs \
+            materialize /workspace "${certification_tree}" /opt/automated-api/.autoapi-certification-source.json
+        test "$(env -i PATH=/usr/bin:/bin GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_NO_REPLACE_OBJECTS=1 \
+          /usr/bin/git -C "${certification_source}" rev-parse HEAD)" = "${certification_head}"
+        test "$(env -i PATH=/usr/bin:/bin GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_NO_REPLACE_OBJECTS=1 \
+          /usr/bin/git -C "${certification_source}" rev-parse HEAD^{tree})" = "${certification_tree}"
+        # CERTIFICATION_SOURCE_MATERIALIZATION_END
+        git -C "${GITHUB_WORKSPACE}" archive --format=tar HEAD | tar -xf - -C "${resolution_source}"
+        resolution_changed="$(node "${runner_source}/packages/runner/dist/dependencyResolutionCli.js" \
+          "${JOB_PATH}" "${resolution_source}")"
+        test "${resolution_changed}" = changed || test "${resolution_changed}" = unchanged
+        # One exact reviewed Kotlin overlay activates its target framework BOM
+        # through a code-owned property. Never apply it to baseline certification.
+        maven_target_property=""
+        if [ "${manager_variant}" = jvm-maven ] && [ "${resolution_changed}" = changed ]; then
+          maven_target_property="$(node "${runner_source}/packages/runner/dist/dependencyResolutionCli.js" \
+            "${JOB_PATH}" "${resolution_source}" --maven-target-property)"
+          case "${maven_target_property}" in ""|-Dspring-ai.version=2.0.0-M8) ;; *) echo "Unreviewed Maven target property" >&2; exit 2;; esac
+        fi
+        vcpkg_baseline=""
+        if [ "${manager_variant}" = c-vcpkg ] || [ "${manager_variant}" = cpp-vcpkg ]; then
+          vcpkg_baseline="$(node -e 'const fs=require("fs"); const value=JSON.parse(fs.readFileSync(process.argv[1], "utf8"))["builtin-baseline"]; if (!/^[a-f0-9]{40}$/.test(value ?? "")) process.exit(2); process.stdout.write(value)' "${dependency_source}/vcpkg.json")"
+          test "${vcpkg_baseline}" = "${manager_version}"
+        fi
+        lockfile_before_sha256=""
+        if [ "${manager_lockfile}" != . ]; then
+          lockfile_before_sha256="$(sha256sum "${GITHUB_WORKSPACE}/${manager_directory}/${manager_lockfile}" | awk '{print $1}')"
+        fi
+
+        # This volume contains public download bytes, not a certified cache.
+        # Never mount it into source builders, certification or validation.
+        python_public_archive_mount=()
+        if [ -n "${PYTHON_PUBLIC_ARCHIVE_CACHE_VOLUME:-}" ]; then
+          [ "${manager_variant}" = python-uv ] || { echo "Public Python archives require uv" >&2; exit 2; }
+          printf "%s" "${PYTHON_PUBLIC_ARCHIVE_CACHE_VOLUME}" | grep -Eq '^autoapi-python-public-[a-z0-9][a-z0-9-]{0,80}$' || { echo "Invalid public archive volume" >&2; exit 2; }
+          if ! docker volume inspect "${PYTHON_PUBLIC_ARCHIVE_CACHE_VOLUME}" >/dev/null 2>&1; then
+            docker volume create --label autoapi.public-python-archives=1 "${PYTHON_PUBLIC_ARCHIVE_CACHE_VOLUME}" >/dev/null
+          fi
+          [ "$(docker volume inspect --format '{{index .Labels "autoapi.public-python-archives"}}' "${PYTHON_PUBLIC_ARCHIVE_CACHE_VOLUME}")" = 1 ] || { echo "Public archive volume is not purpose-owned" >&2; exit 2; }
+          docker run --rm --network none --user 0:0 --mount "type=volume,src=${PYTHON_PUBLIC_ARCHIVE_CACHE_VOLUME},dst=/public-archives" "${analysis_image}" chmod 0777 /public-archives
+          python_public_archive_mount=(--mount "type=volume,src=${PYTHON_PUBLIC_ARCHIVE_CACHE_VOLUME},dst=/opt/python-public-archives")
+        fi
+
+        # This is the only networked customer package-manager phase. It runs
+        # against a disposable git archive, never the private checkout. Exact
+        # manager selection and the rejected hook/plugin configurations are
+        # code-owned, and the resulting cache is consumed only after egress is
+        # disabled.
+        # Some reviewed Maven wrappers use RUNNER_TEMP for their distribution.
+        # Keep that directory in this job's cache across all three containers;
+        # do not replace the host runner's own temporary-directory variable.
+        maven_wrapper_cache_environment=()
+        if [ "${manager_variant}" = jvm-maven ]; then
+          maven_wrapper_cache_environment=(--env RUNNER_TEMP=/opt/dependency-cache/maven-wrapper)
+        fi
+        docker run --rm --user "$(id -u):$(id -g)" \
+          ${maven_wrapper_cache_environment[@]+"${maven_wrapper_cache_environment[@]}"} \
+          ${python_public_archive_mount[@]+"${python_public_archive_mount[@]}"} \
+          --env "PYTHON_PUBLIC_ARCHIVE_CACHE=${PYTHON_PUBLIC_ARCHIVE_CACHE_VOLUME:+/opt/python-public-archives}" \
+          --mount "type=bind,src=${runner_source},dst=/opt/automated-api,readonly" \
+          --mount "type=bind,src=${customer_source},dst=/workspace" \
+          --mount "type=bind,src=${dependency_source},dst=/opt/dependency-source" \
+          --mount "type=bind,src=${resolution_source},dst=/opt/dependency-resolution" \
+          --mount "type=bind,src=${dependency_cache},dst=/opt/dependency-cache" \
+          --workdir "${manager_workdir}" \
+          --mount "type=bind,src=${JOB_PATH},dst=/input/job.json,readonly" \
+          --env "HOME=/opt/dependency-cache/home" \
+          --env "COREPACK_HOME=/opt/dependency-cache/corepack" \
+          --env "COREPACK_ENABLE_NETWORK=1" \
+          --env "npm_config_cache=/opt/dependency-cache/npm" \
+          --env "npm_config_fetch_timeout=45000" \
+          --env "npm_config_fetch_retries=0" \
+          --env "pnpm_config_store_dir=/opt/dependency-cache/pnpm" \
+          --env "npm_config_ignore_pnpmfile=true" \
+          --env "XDG_CACHE_HOME=/opt/dependency-cache/xdg-cache" \
+          --env "CARGO_HOME=/opt/dependency-cache/cargo" \
+          --env "CARGO_TARGET_DIR=/opt/dependency-cache/cargo-target" \
+          --env "CARGO_BUILD_JOBS=2" \
+          --env "CARGO_NET_GIT_FETCH_WITH_CLI=false" \
+          --env "RUSTUP_TOOLCHAIN=${rust_version}-x86_64-unknown-linux-gnu" \
+          --env "GOPATH=/opt/dependency-cache/go" \
+          --env "GOMODCACHE=/opt/dependency-cache/go/pkg/mod" \
+          --env "GOCACHE=/opt/dependency-cache/go-build" \
+          --env "MAVEN_USER_HOME=/opt/dependency-cache/m2" \
+          --env "MAVEN_OPTS=-Dmaven.repo.local=/opt/dependency-cache/m2/repository" \
+          --env "COURSIER_CACHE=/opt/dependency-cache/coursier/cache" \
+          --env "COURSIER_ARCHIVE_CACHE=/opt/dependency-cache/coursier/archive" \
+          --env "COURSIER_JVM_CACHE=/opt/dependency-cache/coursier/jvm" \
+          --env "COURSIER_CONFIG_DIR=/opt/dependency-cache/coursier/config" \
+          --env "COURSIER_DATA_DIR=/opt/dependency-cache/coursier/data" \
+          --env "JAVA_TOOL_OPTIONS=-Duser.home=/opt/dependency-cache/home -Dsbt.global.base=/opt/dependency-cache/sbt/global -Dsbt.boot.directory=/opt/dependency-cache/sbt/boot -Dsbt.ivy.home=/opt/dependency-cache/sbt/ivy -Dsbt.coursier.home=/opt/dependency-cache/coursier/cache -Dsbt.server.autostart=false -Dsbt.supershell=false -Dsbt.color=false -Dsbt.log.noformat=true" \
+          --env "SBT_OPTS=-Duser.home=/opt/dependency-cache/home -Dsbt.global.base=/opt/dependency-cache/sbt/global -Dsbt.boot.directory=/opt/dependency-cache/sbt/boot -Dsbt.ivy.home=/opt/dependency-cache/sbt/ivy -Dsbt.coursier.home=/opt/dependency-cache/coursier/cache -Dsbt.server.autostart=false -Dsbt.supershell=false -Dsbt.color=false -Dsbt.log.noformat=true" \
+          --env "GRADLE_USER_HOME=/opt/dependency-cache/gradle" \
+          --env "GRADLE_OPTS=-Dorg.gradle.workers.max=2 -Dorg.gradle.daemon=false" \
+          --env "AUTOAPI_GRADLE_PREFETCH_PROJECTS=${gradle_prefetch_projects}" \
+          --env "AUTOAPI_GRADLE_PREFETCH_TASKS=${gradle_prefetch_tasks}" \
+          --env "NUGET_PACKAGES=/opt/dependency-cache/nuget" \
+          --env "COMPOSER_HOME=/opt/dependency-cache/composer-home" \
+          --env "COMPOSER_CACHE_DIR=/opt/dependency-cache/composer-cache" \
+          --env "COMPOSER_ROOT_VERSION=${composer_root_version}" \
+          --env "SYMFONY_PHPUNIT_DIR=/opt/dependency-cache/symfony-phpunit" \
+          --env "BUNDLE_PATH=/opt/dependency-cache/bundle" \
+          --env "PUB_CACHE=/opt/dependency-cache/pub" \
+          --env "MIX_HOME=/opt/dependency-cache/mix" \
+          --env "HEX_HOME=/opt/dependency-cache/hex" \
+          --env "MIX_ENV=test" \
+          --env "HEX_OFFLINE=0" \
+          --env "CLJ_CONFIG=/opt/dependency-cache/clojure" \
+          --env "LEIN_HOME=/opt/dependency-cache/lein" \
+          --env "VCPKG_DISABLE_METRICS=1" \
+          --env "LEIN_JVM_OPTS=-Duser.home=/opt/dependency-cache/home" \
+          --env "PIP_DEFAULT_TIMEOUT=60" \
+          --env "PIP_RETRIES=10" \
+          --env "PIP_CACHE_DIR=/opt/dependency-cache/pip" \
+          --env "YARN_CACHE_FOLDER=/opt/dependency-cache/yarn-classic" \
+          --env "YARN_ENABLE_GLOBAL_CACHE=true" \
+          --env "YARN_GLOBAL_FOLDER=/opt/dependency-cache/yarn-berry" \
+          --env "YARN_ENABLE_SCRIPTS=false" \
+          --env "YARN_IGNORE_PATH=1" \
+          --env "YARN_ENABLE_CONSTRAINTS_CHECKS=false" \
+          --env "MANAGER_NAME=${manager_name}" \
+          --env "MANAGER_VERSION=${manager_version}" \
+          --env "MANAGER_VARIANT=${manager_variant}" \
+          --env "MANAGER_SPEC=${manager_spec}" \
+          --env "MANAGER_LOCKFILE=${manager_lockfile}" \
+          --env "MANAGER_MANIFEST=${manager_manifest}" \
+          --env "VCPKG_BASELINE=${vcpkg_baseline}" \
+          --env "PYTHON_VERSION=${python_version}" \
+          --env "RUNTIME_VERSION=${runtime_version}" \
+          --env "ERLANG_VERSION=${erlang_version}" \
+          --env "SCALA_VERSION=${scala_version}" \
+          --env "COURSIER_VERSION=${coursier_version}" \
+          --env "HEX_VERSION=${hex_version}" \
+          --env "HEX_ARCHIVE_URL=${hex_archive_url}" \
+          --env "HEX_ARCHIVE_SHA512=${hex_archive_sha512}" \
+          --env "REBAR3_VERSION=${rebar3_version}" \
+          --env "REBAR3_ARCHIVE_URL=${rebar3_archive_url}" \
+          --env "REBAR3_ARCHIVE_SHA512=${rebar3_archive_sha512}" \
+          --env "AUTOAPI_JOB_DEADLINE_AT=${job_deadline_at}" \
+          --env "AUTOMATED_API_RESOLVED_PYTHON_VERSION=${python_version}" \
+          --env "RESOLUTION_CHANGED=${resolution_changed}" \
+          --env "RESOLUTION_WORKDIR=${resolution_workdir}" \
+          --env "MAVEN_TARGET_PROPERTY=${maven_target_property}" \
+          "${runner_image}" \
+          sh -c 'set -eu; mkdir -p "$HOME" "$MAVEN_USER_HOME" "$GRADLE_USER_HOME" "$NUGET_PACKAGES" "$COMPOSER_HOME" "$COMPOSER_CACHE_DIR" "$BUNDLE_PATH" "$PUB_CACHE" "$MIX_HOME" "$HEX_HOME";
+          retry_network() {
+            attempt=1;
+            while ! "$@"; do
+              if [ "$attempt" -ge 3 ]; then return 1; fi;
+              sleep "$((attempt * 2))";
+              attempt="$((attempt + 1))";
+            done;
+          };
+          retry_vcpkg_install() {
+            vcpkg_attempt=1;
+            vcpkg_previous_failure_sha=;
+            vcpkg_failure_log=/opt/dependency-cache/vcpkg-last-install.log;
+            while true; do
+              if "$@" > "$vcpkg_failure_log" 2>&1; then
+                cat "$vcpkg_failure_log";
+                return 0;
+              else
+                vcpkg_status=$?;
+              fi;
+              cat "$vcpkg_failure_log";
+              vcpkg_failure_sha="$(sha256sum "$vcpkg_failure_log" | cut -d " " -f 1)";
+              if grep -Fq "failed with: BUILD_FAILED" "$vcpkg_failure_log" \
+                || [ "$vcpkg_failure_sha" = "$vcpkg_previous_failure_sha" ] \
+                || [ "$vcpkg_attempt" -ge 3 ]; then
+                return "$vcpkg_status";
+              fi;
+              vcpkg_previous_failure_sha="$vcpkg_failure_sha";
+              sleep "$((vcpkg_attempt * 2))";
+              vcpkg_attempt="$((vcpkg_attempt + 1))";
+            done;
+          };
+          if [ "$MANAGER_VARIANT" = jvm-gradle ]; then
+            gradle_root="$(pwd -P)";
+            case "$gradle_root" in /workspace|/workspace/*) ;; *) exit 1;; esac;
+            while [ ! -x "$gradle_root/gradlew" ] && [ "$gradle_root" != /workspace ]; do gradle_root="$(dirname "$gradle_root")"; done;
+            gradle_wrapper="$gradle_root/gradlew";
+            wrapper_properties="$gradle_root/gradle/wrapper/gradle-wrapper.properties";
+            [ -x "$gradle_wrapper" ];
+            [ ! -L "$gradle_wrapper" ];
+            [ -f "$wrapper_properties" ];
+            [ ! -L "$wrapper_properties" ];
+            distribution_url="$(sed -n "s/^distributionUrl=//p" "$wrapper_properties" | sed "s/\\\\:/:/g")";
+            distribution_sha256="$(sed -n "s/^distributionSha256Sum=//p" "$wrapper_properties")";
+            [ "$distribution_url" = "https://services.gradle.org/distributions/gradle-${MANAGER_VERSION}-bin.zip" ];
+            printf "%s" "$distribution_sha256" | grep -Eq "^[a-f0-9]{64}$";
+            distribution_name="gradle-${MANAGER_VERSION}-bin";
+            distribution_hash="$(node /opt/autoapi-runtime/gradle-wrapper/gradleWrapperCli.js "$distribution_url")";
+            distribution_directory="$GRADLE_USER_HOME/wrapper/dists/$distribution_name/$distribution_hash";
+            distribution_zip="$distribution_directory/$distribution_name.zip";
+            mkdir -p "$distribution_directory";
+            if ! printf "%s  %s\n" "$distribution_sha256" "$distribution_zip" | sha256sum -c - >/dev/null 2>&1; then
+              rm -f "$distribution_zip" "$distribution_zip.part";
+              retry_network curl --fail --location --retry 3 --retry-all-errors --connect-timeout 30 --max-time 600 \
+                --output "$distribution_zip.part" "$distribution_url";
+              printf "%s  %s\n" "$distribution_sha256" "$distribution_zip.part" | sha256sum -c -;
+              mv "$distribution_zip.part" "$distribution_zip";
+            fi;
+            if grep -q "^networkTimeout=" "$wrapper_properties"; then
+              sed -i "s/^networkTimeout=.*/networkTimeout=60000/" "$wrapper_properties";
+            else
+              printf "\nnetworkTimeout=60000\n" >> "$wrapper_properties";
+            fi;
+            grep -q "^networkTimeout=60000$" "$wrapper_properties";
+          fi;
+          case "$MANAGER_VARIANT" in
+            analysis-only)
+              [ "$MANAGER_NAME" = none ] ;;
+            npm)
+              [ "$MANAGER_NAME" = npm ];
+              mkdir -p /opt/dependency-cache/npm-manager;
+              retry_network npm --prefix /opt/dependency-cache/npm-manager install --ignore-scripts --no-audit --no-fund "npm@$MANAGER_VERSION";
+              npm_cli=/opt/dependency-cache/npm-manager/node_modules/npm/bin/npm-cli.js;
+              [ "$(node "$npm_cli" --version)" = "$MANAGER_VERSION" ];
+              retry_network node "$npm_cli" ci --ignore-scripts --no-audit --no-fund;
+              retry_network node "$npm_cli" --prefix /opt/dependency-source install --ignore-scripts --no-audit --no-fund ;;
+            pnpm)
+              [ "$MANAGER_NAME" = pnpm ]; retry_network corepack install --global "$MANAGER_SPEC";
+              [ "$(corepack pnpm --version)" = "$MANAGER_VERSION" ];
+              retry_network corepack pnpm install --frozen-lockfile --ignore-scripts --store-dir /opt/dependency-cache/pnpm;
+              if [ "$RESOLUTION_CHANGED" = changed ]; then
+                retry_network corepack pnpm --dir "$RESOLUTION_WORKDIR" install --no-frozen-lockfile --ignore-scripts --store-dir /opt/dependency-cache/pnpm;
+              fi;
+              retry_network corepack pnpm --dir /opt/dependency-source install --ignore-scripts --store-dir /opt/dependency-cache/pnpm ;;
+            yarn-classic)
+              [ "$MANAGER_NAME" = yarn ]; retry_network corepack install --global "$MANAGER_SPEC";
+              [ "$(corepack yarn --version)" = "$MANAGER_VERSION" ];
+              retry_network corepack yarn install --frozen-lockfile --ignore-scripts --cache-folder /opt/dependency-cache/yarn-classic;
+              retry_network corepack yarn --cwd /opt/dependency-source install --ignore-scripts --cache-folder /opt/dependency-cache/yarn-classic ;;
+            yarn-berry)
+              [ "$MANAGER_NAME" = yarn ]; retry_network corepack install --global "$MANAGER_SPEC";
+              [ "$(corepack yarn --version)" = "$MANAGER_VERSION" ];
+              retry_network corepack yarn install --immutable --mode=skip-build;
+              retry_network corepack yarn --cwd /opt/dependency-source install --mode=skip-build ;;
+            python-pip)
+              [ "$MANAGER_NAME" = pip ]; [ "$(python --version 2>&1)" = "Python $PYTHON_VERSION" ];
+              [ "$(python -m pip --version | awk "{print \$2}")" = "$MANAGER_VERSION" ];
+              mkdir -p /opt/dependency-cache/python-wheels /opt/dependency-cache/python-site;
+              retry_network python -m pip download --require-hashes --only-binary=:all: --dest /opt/dependency-cache/python-wheels --requirement "$MANAGER_LOCKFILE";
+              python -m pip install --require-hashes --no-index --find-links /opt/dependency-cache/python-wheels --only-binary=:all: --target /opt/dependency-cache/python-site --requirement "$MANAGER_LOCKFILE";
+              if [ -s "/opt/dependency-source/$MANAGER_MANIFEST" ]; then
+                retry_network python -m pip download --only-binary=:all: --dest /opt/dependency-cache/python-wheels --requirement "/opt/dependency-source/$MANAGER_MANIFEST";
+              fi ;;
+            python-uv)
+              [ "$MANAGER_NAME" = uv ]; [ "$(python --version 2>&1)" = "Python $PYTHON_VERSION" ];
+              mkdir -p /opt/dependency-cache/uv-tool /opt/dependency-cache/uv;
+              if [ "$MANAGER_VERSION" = 0.12.5 ]; then
+                python -I /opt/automated-api/scripts/lib/python-certified-environment.py bootstrap-uv \
+                  /opt/dependency-cache /input/job.json "$MANAGER_NAME@$MANAGER_VERSION" ${PYTHON_PUBLIC_ARCHIVE_CACHE:+"$PYTHON_PUBLIC_ARCHIVE_CACHE"};
+              elif [ ! -x /opt/dependency-cache/uv-tool/bin/uv ]; then
+                retry_network python -m pip install --no-deps --only-binary=:all: --target /opt/dependency-cache/uv-tool "uv==$MANAGER_VERSION";
+              fi;
+              [ "$(/opt/dependency-cache/uv-tool/bin/uv --version | awk "{print \$2}")" = "$MANAGER_VERSION" ];
+              if [ "$MANAGER_VERSION" = 0.12.5 ]; then
+                python -I /opt/automated-api/scripts/lib/python-certified-environment.py prefetch \
+                  "$PWD" /opt/dependency-cache /input/job.json /opt/dependency-cache/uv-tool/bin/uv ${PYTHON_PUBLIC_ARCHIVE_CACHE:+"$PYTHON_PUBLIC_ARCHIVE_CACHE"};
+              else
+                retry_network env PATH="/opt/dependency-cache/uv-tool/bin:$PATH" UV_CACHE_DIR=/opt/dependency-cache/uv \
+                  uv sync --frozen --no-install-workspace --no-build --python "$PYTHON_VERSION";
+                if [ "$RESOLUTION_CHANGED" = changed ]; then
+                  retry_network env PATH="/opt/dependency-cache/uv-tool/bin:$PATH" UV_CACHE_DIR=/opt/dependency-cache/uv \
+                    uv sync --directory "$RESOLUTION_WORKDIR" --no-install-workspace --no-build --python "$PYTHON_VERSION";
+                fi;
+              fi;
+              if [ -s "/opt/dependency-source/$MANAGER_MANIFEST" ]; then
+                retry_network env PATH="/opt/dependency-cache/uv-tool/bin:$PATH" UV_CACHE_DIR=/opt/dependency-cache/uv \
+                  uv lock --directory /opt/dependency-source --no-build --python "$PYTHON_VERSION";
+                retry_network env PATH="/opt/dependency-cache/uv-tool/bin:$PATH" UV_CACHE_DIR=/opt/dependency-cache/uv \
+                  uv sync --directory /opt/dependency-source --frozen --no-install-project --no-build --python "$PYTHON_VERSION";
+              fi ;;
+            python-stdlib)
+              [ "$MANAGER_NAME" = python ];
+              [ "$(python --version 2>&1)" = "Python $PYTHON_VERSION" ] ;;
+            rust-cargo)
+              [ "$MANAGER_NAME" = cargo ]; [ "$(cargo --version | awk "{print \$2}")" = "$MANAGER_VERSION" ];
+              retry_network cargo fetch --locked --target x86_64-unknown-linux-gnu;
+              if [ "$RESOLUTION_CHANGED" = changed ]; then
+                retry_network cargo fetch --target x86_64-unknown-linux-gnu --manifest-path "$RESOLUTION_WORKDIR/Cargo.toml";
+              fi;
+              retry_network cargo fetch --target x86_64-unknown-linux-gnu --manifest-path "/opt/dependency-source/$MANAGER_MANIFEST" ;;
+            go-modules)
+              [ "$MANAGER_NAME" = go ]; [ "$(go version | awk "{print \$3}")" = "go$MANAGER_VERSION" ];
+              mkdir -p /opt/dependency-cache/go-tools;
+              retry_network env GOBIN=/opt/dependency-cache/go-tools go install golang.org/x/tools/cmd/goimports@v0.36.0;
+              retry_network go mod download;
+              if [ "$RESOLUTION_CHANGED" = changed ]; then
+                (cd "$RESOLUTION_WORKDIR" && retry_network go mod tidy);
+              fi;
+              (cd /opt/dependency-source && retry_network go mod download) ;;
+            jvm-maven)
+              maven_root="$PWD";
+              while [ ! -x "$maven_root/mvnw" ] && [ "$maven_root" != /workspace ]; do maven_root="$(dirname "$maven_root")"; done;
+              maven_wrapper="$maven_root/mvnw";
+              [ -x "$maven_wrapper" ];
+              [ "$MANAGER_NAME" = maven ]; [ "$("$maven_wrapper" --version | grep -oE "[0-9]+([.][0-9]+)+" | head -1)" = "$MANAGER_VERSION" ];
+              retry_network "$maven_wrapper" -B -DskipTests dependency:go-offline dependency:resolve dependency:resolve-plugins;
+              if [ "$RESOLUTION_CHANGED" = changed ]; then
+                set --;
+                if [ -n "$MAVEN_TARGET_PROPERTY" ]; then set -- "$MAVEN_TARGET_PROPERTY"; fi;
+                retry_network "$maven_wrapper" -B -f "$RESOLUTION_WORKDIR/pom.xml" "$@" -DskipTests dependency:go-offline dependency:resolve dependency:resolve-plugins;
+                # Surefire selects its JUnit Platform provider dynamically at
+                # test execution, so dependency:go-offline cannot discover it.
+                # Seed only the exact provider pinned by the reviewed Embabel
+                # proof POM; MAVEN_TARGET_PROPERTY is emitted only after that
+                # repository, event and policy tuple passes code-owned review.
+                if [ "$MAVEN_TARGET_PROPERTY" = -Dspring-ai.version=2.0.0-M8 ]; then
+                  retry_network "$maven_wrapper" -B \
+                    org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get \
+                    -Dartifact=org.apache.maven.surefire:surefire-junit-platform:3.5.4 \
+                    -Dtransitive=true;
+                  # Spring Boot 4.1.0-RC1 dependency management selects JUnit
+                  # Platform 6.0.3, but Surefire resolves its launcher only at
+                  # test execution. Cache that exact dynamic runtime as well.
+                  retry_network "$maven_wrapper" -B \
+                    org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get \
+                    -Dartifact=org.junit.platform:junit-platform-launcher:6.0.3 \
+                    -Dtransitive=true;
+                fi;
+              fi;
+              retry_network "$maven_wrapper" -B -f "/opt/dependency-source/$MANAGER_MANIFEST" -DskipTests dependency:go-offline dependency:resolve dependency:resolve-plugins ;;
+            jvm-gradle)
+              gradle_root="$(pwd -P)";
+              case "$gradle_root" in /workspace|/workspace/*) ;; *) exit 1;; esac;
+              while [ ! -x "$gradle_root/gradlew" ] && [ "$gradle_root" != /workspace ]; do gradle_root="$(dirname "$gradle_root")"; done;
+              gradle_wrapper="$gradle_root/gradlew";
+              [ -x "$gradle_wrapper" ];
+              [ ! -L "$gradle_wrapper" ];
+              [ "$MANAGER_NAME" = gradle ]; [ "$("$gradle_wrapper" --version | sed -n "s/^Gradle //p" | head -1)" = "$MANAGER_VERSION" ];
+              gradle_prefetch=/opt/autoapi-runtime/gradle-dependency-prefetch.init.gradle;
+              if [ "$AUTOAPI_GRADLE_PREFETCH_TASKS" = \* ]; then
+                retry_network "$gradle_wrapper" --no-daemon --no-parallel "-Pkotlin.compiler.execution.strategy=in-process" --init-script "$gradle_prefetch" autoApiPrefetchDependencies;
+                if [ "$RESOLUTION_CHANGED" = changed ]; then retry_network "$gradle_wrapper" --no-daemon --no-parallel "-Pkotlin.compiler.execution.strategy=in-process" -p "$RESOLUTION_WORKDIR" --init-script "$gradle_prefetch" --write-locks autoApiPrefetchDependencies; fi;
+              else
+                retry_network env AUTOAPI_GRADLE_PREFETCH_TASK_GRAPH=1 "$gradle_wrapper" --no-daemon --no-parallel "-Pkotlin.compiler.execution.strategy=in-process" --init-script "$gradle_prefetch" --dry-run autoApiPrefetchValidationDependencies;
+                if [ "$RESOLUTION_CHANGED" = changed ]; then retry_network env AUTOAPI_GRADLE_PREFETCH_TASK_GRAPH=1 "$gradle_wrapper" --no-daemon --no-parallel "-Pkotlin.compiler.execution.strategy=in-process" -p "$RESOLUTION_WORKDIR" --init-script "$gradle_prefetch" --write-locks --dry-run autoApiPrefetchValidationDependencies; fi;
+              fi;
+              retry_network env AUTOAPI_GRADLE_PREFETCH_PROJECTS="*" AUTOAPI_GRADLE_PREFETCH_TASKS="*" "$gradle_wrapper" --no-daemon --no-parallel "-Pkotlin.compiler.execution.strategy=in-process" -p /opt/dependency-source --init-script "$gradle_prefetch" --write-locks autoApiPrefetchDependencies ;;
+            scala-sbt)
+              [ "$MANAGER_NAME" = sbt ]; [ "$COURSIER_VERSION" = 2.1.24 ];
+              coursier_url="https://github.com/coursier/coursier/releases/download/v${COURSIER_VERSION}/cs-x86_64-pc-linux.gz";
+              coursier_sha256=d2c0572a17fb6146ea65349b59dd216b38beff60ae22bce6e549867c6ed2eda6;
+              mkdir -p /opt/dependency-cache/coursier/bin /opt/dependency-cache/coursier/cache /opt/dependency-cache/sbt;
+              if [ ! -x /opt/dependency-cache/coursier/bin/cs ]; then
+                retry_network curl --fail --location --retry 3 --retry-all-errors --connect-timeout 30 --max-time 600 --output /tmp/cs.gz "$coursier_url";
+                printf "%s  %s\n" "$coursier_sha256" /tmp/cs.gz | sha256sum -c -;
+                gzip -dc /tmp/cs.gz > /opt/dependency-cache/coursier/bin/cs;
+                chmod 755 /opt/dependency-cache/coursier/bin/cs;
+                rm /tmp/cs.gz;
+              fi;
+              export PATH="/opt/dependency-cache/coursier/bin:$PATH";
+              [ "$(cs version)" = "$COURSIER_VERSION" ];
+              sbt_version_output="$(cs launch "sbt:${MANAGER_VERSION}" -- "show sbtVersion")";
+              [ "$(printf "%s\n" "$sbt_version_output" | grep -E "^\[info\] [0-9]+([.][0-9]+)+$" | cut -d " " -f2 | sort -u)" = "$MANAGER_VERSION" ];
+              retry_network cs launch "sbt:${MANAGER_VERSION}" -- update scalaCompilerBridgeBinaryJar;
+              if [ "$RESOLUTION_CHANGED" = changed ]; then (cd "$RESOLUTION_WORKDIR" && retry_network cs launch "sbt:${MANAGER_VERSION}" -- update scalaCompilerBridgeBinaryJar); fi;
+              (cd /opt/dependency-source && retry_network cs launch "sbt:${MANAGER_VERSION}" -- update scalaCompilerBridgeBinaryJar) ;;
+            dotnet-nuget)
+              [ "$MANAGER_NAME" = dotnet ]; [ "$(dotnet --version)" = "$MANAGER_VERSION" ];
+              retry_network dotnet restore --locked-mode --packages "$NUGET_PACKAGES" -p:EnableWindowsTargeting=true;
+              if [ "$RESOLUTION_CHANGED" = changed ]; then (cd "$RESOLUTION_WORKDIR" && retry_network dotnet restore --force-evaluate --packages "$NUGET_PACKAGES" -p:EnableWindowsTargeting=true); fi;
+              (cd /opt/dependency-source && retry_network dotnet restore --force-evaluate --packages "$NUGET_PACKAGES" -p:EnableWindowsTargeting=true) ;;
+            php-composer)
+              [ "$MANAGER_NAME" = composer ]; [ "$(composer --version --no-ansi | awk "{print \$3}")" = "$MANAGER_VERSION" ];
+              retry_network composer install --no-interaction --no-plugins --no-scripts;
+              if [ -x vendor/bin/simple-phpunit ]; then retry_network php vendor/bin/simple-phpunit --version; fi;
+              if [ "$RESOLUTION_CHANGED" = changed ]; then
+                composer_targets="$(node /opt/automated-api/packages/runner/dist/dependencyResolutionCli.js /input/job.json /workspace --composer-targets)";
+                # The CLI permits only literal reviewed vendor/package names, never options or globs.
+                set -- $composer_targets;
+                test "$#" -gt 0;
+                (cd "$RESOLUTION_WORKDIR" && retry_network composer update "$@" --with-dependencies --minimal-changes --no-interaction --no-plugins --no-scripts);
+              fi;
+              (cd /opt/dependency-source && retry_network composer install --no-interaction --no-plugins --no-scripts) ;;
+            ruby-bundler)
+              [ "$MANAGER_NAME" = bundler ]; [ "$(bundle "_${MANAGER_VERSION}_" --version | awk "{print \$3}")" = "$MANAGER_VERSION" ];
+              retry_network bundle "_${MANAGER_VERSION}_" install;
+              if [ "$RESOLUTION_CHANGED" = changed ]; then
+                ruby_targets="$(node /opt/automated-api/packages/runner/dist/dependencyResolutionCli.js /input/job.json /workspace --ruby-targets)";
+                # The CLI permits only literal reviewed gem names, never options or globs.
+                set -- $ruby_targets;
+                test "$#" -gt 0;
+                (cd "$RESOLUTION_WORKDIR" && retry_network bundle "_${MANAGER_VERSION}_" update "$@");
+              fi;
+              (cd /opt/dependency-source && retry_network bundle "_${MANAGER_VERSION}_" install) ;;
+            swift-package)
+              [ "$MANAGER_NAME" = swift ]; swift_actual="$(swift --version | grep -oE "[0-9]+([.][0-9]+)+" | head -1)";
+              case "$MANAGER_VERSION" in "$swift_actual"|"$swift_actual.0") ;; *) exit 1 ;; esac;
+              retry_network swift package resolve;
+              if [ "$RESOLUTION_CHANGED" = changed ]; then (cd "$RESOLUTION_WORKDIR" && retry_network swift package resolve); fi ;;
+            dart-pub)
+              [ "$MANAGER_NAME" = dart ]; [ "$(dart --version 2>&1 | grep -oE "[0-9]+([.][0-9]+)+" | head -1)" = "$MANAGER_VERSION" ];
+              retry_network dart pub get;
+              if [ "$RESOLUTION_CHANGED" = changed ]; then (cd "$RESOLUTION_WORKDIR" && retry_network dart pub get); fi ;;
+            elixir-mix)
+              [ "$MANAGER_NAME" = mix ]; [ "$(elixir --version | grep "^Elixir " | cut -d " " -f2)" = "$RUNTIME_VERSION" ];
+              [ "$(mix --version | grep "^Mix " | cut -d " " -f2)" = "$MANAGER_VERSION" ];
+              tools_dir=/opt/dependency-cache/elixir-tools; mkdir -p "$tools_dir";
+              hex_archive="$tools_dir/hex.ez"; rebar3_archive="$tools_dir/rebar3";
+              rm -f "$hex_archive.part" "$rebar3_archive.part";
+              retry_network curl --fail --silent --show-error --location "$HEX_ARCHIVE_URL" --output "$hex_archive.part";
+              printf "%s  %s\n" "$HEX_ARCHIVE_SHA512" "$hex_archive.part" | sha512sum --check --status;
+              mv "$hex_archive.part" "$hex_archive";
+              retry_network curl --fail --silent --show-error --location "$REBAR3_ARCHIVE_URL" --output "$rebar3_archive.part";
+              printf "%s  %s\n" "$REBAR3_ARCHIVE_SHA512" "$rebar3_archive.part" | sha512sum --check --status;
+              mv "$rebar3_archive.part" "$rebar3_archive"; chmod 755 "$rebar3_archive";
+              mix archive.install "$hex_archive" --sha512 "$HEX_ARCHIVE_SHA512" --force;
+              mix local.rebar rebar3 "$rebar3_archive" --sha512 "$REBAR3_ARCHIVE_SHA512" --force;
+              hex_info="$(mix hex.info)" || { printf "%s\n" "Hex version command failed" >&2; exit 1; };
+              hex_actual="$(printf "%s\n" "$hex_info" | sed -n "s/^Hex:[[:space:]]*//p" | head -1)";
+              [ "$hex_actual" = "$HEX_VERSION" ] || { printf "Hex version mismatch: expected %s, found %s\n" "$HEX_VERSION" "${hex_actual:-<missing>}" >&2; exit 1; };
+              elixir_minor="$(printf "%s" "$RUNTIME_VERSION" | cut -d. -f1-2 | tr . -)"; otp_major="${ERLANG_VERSION%%.*}";
+              local_rebar3="$MIX_HOME/elixir/${elixir_minor}-otp-${otp_major}/rebar3";
+              [ "$("$local_rebar3" version | grep -oE "[0-9]+([.][0-9]+){2}" | head -1)" = "$REBAR3_VERSION" ];
+              retry_network mix deps.get --only test;
+              if [ "$RESOLUTION_CHANGED" = changed ]; then (cd "$RESOLUTION_WORKDIR" && retry_network mix deps.get --only test); fi;
+              (cd /opt/dependency-source && retry_network mix deps.get --only test);
+              retry_network elixir -pa "$MIX_HOME/archives/hex-$HEX_VERSION/hex-$HEX_VERSION/ebin" \
+                -r /opt/automated-api/scripts/lib/prime-hex-registry.ex \
+                -e "AutoAPI.HexRegistryPrefetch.run(System.argv())" -- \
+                "$PWD/mix.lock" "$RESOLUTION_WORKDIR/mix.lock" /opt/dependency-source/mix.lock ;;
+            clojure-tools-deps)
+              [ "$MANAGER_NAME" = clojure ];
+              [ "$(clojure -Sdescribe | grep -oE "[0-9]+([.][0-9]+)+" | head -1)" = "$MANAGER_VERSION" ];
+              retry_network clojure -P;
+              if [ "$RESOLUTION_CHANGED" = changed ]; then (cd "$RESOLUTION_WORKDIR" && retry_network clojure -P); fi;
+              (cd /opt/dependency-source && retry_network clojure -P) ;;
+            clojure-leiningen)
+              [ "$MANAGER_NAME" = leiningen ];
+              [ "$(lein version | grep -oE "[0-9]+([.][0-9]+)+" | head -1)" = "$MANAGER_VERSION" ];
+              retry_network lein deps;
+              if [ "$RESOLUTION_CHANGED" = changed ]; then (cd "$RESOLUTION_WORKDIR" && retry_network lein deps); fi;
+              (cd /opt/dependency-source && retry_network lein deps) ;;
+            c-vcpkg|cpp-vcpkg)
+              [ "$MANAGER_NAME" = vcpkg ];
+              case "$MANAGER_VARIANT:$MANAGER_VERSION" in
+                c-vcpkg:1004d5d0f80ac648514e3e6ce8e033f44b45e246)
+                  vcpkg_source_sha256=cd84579f7dc9b4be03504c04658470f2e9b65260640962731faa4cc2fe504897 ;;
+                cpp-vcpkg:cea592f4772491abdb7c483387a59ea89889f4be)
+                  vcpkg_source_sha256=668f977b054ec9523961a80c18b4173ac44f86b75ed6ab2e157821fa50e407ac ;;
+                *) exit 2 ;;
+              esac;
+              [ "$VCPKG_BASELINE" = "$MANAGER_VERSION" ];
+              vcpkg_root=/opt/dependency-cache/vcpkg;
+              sh /opt/automated-api/scripts/lib/install-vcpkg-source.sh \
+                "$vcpkg_root" "$MANAGER_VERSION" "$vcpkg_source_sha256" "$AUTOAPI_JOB_DEADLINE_AT";
+              [ "$(cat "$vcpkg_root/.autoapi-vcpkg-commit")" = "$MANAGER_VERSION" ];
+              [ "$(cat "$vcpkg_root/.autoapi-vcpkg-source-sha256")" = "$vcpkg_source_sha256" ];
+              mkdir -p /opt/dependency-cache/vcpkg-binary /opt/dependency-cache/vcpkg-downloads \
+                /opt/dependency-cache/vcpkg-buildtrees /opt/dependency-cache/vcpkg-installed;
+              retry_vcpkg_install "$vcpkg_root/vcpkg" install --x-manifest-root=/opt/dependency-source \
+                --x-install-root=/opt/dependency-cache/vcpkg-prefetch-installed \
+                --downloads-root=/opt/dependency-cache/vcpkg-downloads \
+                --x-buildtrees-root=/opt/dependency-cache/vcpkg-buildtrees \
+                --binarysource=clear\;files,/opt/dependency-cache/vcpkg-binary,readwrite ;;
+            *) echo "Unsupported package-manager variant" >&2; exit 2 ;;
+          esac;
+          mkdir -p /opt/dependency-cache/resolved-locks;
+          case "$MANAGER_VARIANT" in
+            php-composer) cp "$RESOLUTION_WORKDIR/composer.lock" /opt/dependency-cache/resolved-locks/composer.lock ;;
+            swift-package) cp "$RESOLUTION_WORKDIR/Package.resolved" /opt/dependency-cache/resolved-locks/Package.resolved ;;
+            elixir-mix) cp "$RESOLUTION_WORKDIR/mix.lock" /opt/dependency-cache/resolved-locks/mix.lock ;;
+          esac'
+
+        # Networked preparation never receives the real checkout. Retain an
+        # explicit integrity assertion so a future mount regression fails
+        # before certification or proposal generation.
+        git -C "${GITHUB_WORKSPACE}" diff --quiet --no-ext-diff HEAD --
+        resolved_lockfile=""
+        if [ -f "${dependency_cache}/resolved-locks/composer.lock" ]; then
+          resolved_lockfile=/opt/dependency-cache/resolved-locks/composer.lock
+        elif [ -f "${dependency_cache}/resolved-locks/Package.resolved" ]; then
+          resolved_lockfile=/opt/dependency-cache/resolved-locks/Package.resolved
+        elif [ -f "${dependency_cache}/resolved-locks/mix.lock" ]; then
+          resolved_lockfile=/opt/dependency-cache/resolved-locks/mix.lock
+        fi
+
+        # Execute only reviewed source-build recipes in a separate, bounded
+        # offline container. No customer checkout, job, credentials, Docker
+        # socket, or shared dependency cache is mounted into this process.
+        if [ "${manager_variant}" = python-uv ] && [ -f "${dependency_cache}/python-build-inputs/selection.json" ]; then
+          mkdir -p "${dependency_cache}/python-built-wheels"
+          chmod a+rX "${dependency_cache}/python-build-inputs" "${dependency_cache}/python-build-inputs/"*
+          chmod 0777 "${dependency_cache}/python-built-wheels"
+          python_builder_container="autoapi-python-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          timeout --signal=TERM --kill-after=5 240 docker run --rm --name "${python_builder_container}" --network none --user 65532:65532 \
+            --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --memory 1g --cpus 1 --pids-limit 128 \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,size=536870912 \
+            --mount "type=bind,src=${runner_source}/scripts/lib/python-certified-environment.py,dst=/tool/python-certified-environment.py,readonly" \
+            --mount "type=bind,src=${runner_source}/scripts/lib/python-source-recipes.json,dst=/tool/python-source-recipes.json,readonly" \
+            --mount "type=bind,src=${dependency_cache}/python-build-inputs,dst=/input,readonly" \
+            --mount "type=bind,src=${dependency_cache}/python-built-wheels,dst=/out" \
+            "${runner_image}" python -I /tool/python-certified-environment.py build /input /out
+          python_builder_container=""
+        fi
+
+        # Certify the exact manager/runtime against a fresh exact clone of HEAD with
+        # networking disabled. Package managers may create or rewrite build
+        # metadata even during frozen/offline commands, so certification gets
+        # a disposable writable tree and never the real customer checkout.
+        # This produces the only authority the proposal runner and control
+        # plane accept for toolchain use.
+        test ! -e "${OUTPUT_DIRECTORY}/toolchain-certification.json"
+        test ! -L "${OUTPUT_DIRECTORY}/toolchain-certification.json"
+        docker run --rm --network none --user 0:0 \
+          --mount "type=bind,src=${certification_source},dst=/workspace" \
+          --mount "type=bind,src=${dependency_cache},dst=/opt/dependency-cache" \
+          --mount "type=bind,src=${python_certified_cache},dst=/opt/python-certified-cache" \
+          --mount "type=bind,src=${OUTPUT_DIRECTORY},dst=/output" \
+          --env "CERTIFICATION_RUNTIME_UID=${certification_runtime_uid}" \
+          --env "CERTIFICATION_RUNTIME_GID=${certification_runtime_gid}" \
+          "${runner_image}" sh -c 'chown -R "$CERTIFICATION_RUNTIME_UID:$CERTIFICATION_RUNTIME_GID" /workspace /opt/dependency-cache /opt/python-certified-cache; chown "$CERTIFICATION_RUNTIME_UID:$CERTIFICATION_RUNTIME_GID" /output'
+        certification_manager_container="autoapi-cert-manager-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        docker run --rm --name "${certification_manager_container}" --network none \
+          --user "${certification_runtime_uid}:${certification_runtime_gid}" \
+          --read-only --cap-drop ALL --security-opt no-new-privileges \
+          --memory 2g --cpus 2 --pids-limit 256 \
+          --tmpfs /tmp:rw,exec,nosuid,nodev,size=536870912 \
+          ${maven_wrapper_cache_environment[@]+"${maven_wrapper_cache_environment[@]}"} \
+          --mount "type=bind,src=${runner_source},dst=/opt/automated-api,readonly" \
+          --mount "type=bind,src=${dependency_cache},dst=/opt/dependency-cache" \
+          --mount "type=bind,src=${python_certified_cache},dst=/opt/python-certified-cache" \
+          --mount "type=bind,src=${dependency_source},dst=/opt/dependency-source,readonly" \
+          --mount "type=bind,src=${resolution_source},dst=/opt/dependency-resolution,readonly" \
+          --mount "type=bind,src=${certification_source},dst=/workspace" \
+          --mount "type=bind,src=${JOB_PATH},dst=/input/job.json,readonly" \
+          --workdir "${manager_workdir}" \
+          --env "HOME=/opt/dependency-cache/home" \
+          --env "COREPACK_HOME=/opt/dependency-cache/corepack" \
+          --env "COREPACK_ENABLE_NETWORK=0" \
+          --env "npm_config_cache=/opt/dependency-cache/npm" \
+          --env "pnpm_config_store_dir=/opt/dependency-cache/pnpm" \
+          --env "npm_config_ignore_pnpmfile=true" \
+          --env "XDG_CACHE_HOME=/opt/dependency-cache/xdg-cache" \
+          --env "YARN_CACHE_FOLDER=/opt/dependency-cache/yarn-classic" \
+          --env "YARN_ENABLE_NETWORK=0" \
+          --env "YARN_ENABLE_GLOBAL_CACHE=true" \
+          --env "YARN_GLOBAL_FOLDER=/opt/dependency-cache/yarn-berry" \
+          --env "YARN_ENABLE_SCRIPTS=false" \
+          --env "YARN_IGNORE_PATH=1" \
+          --env "YARN_ENABLE_CONSTRAINTS_CHECKS=false" \
+          --env "UV_CACHE_DIR=/opt/dependency-cache/uv" \
+          --env "CARGO_HOME=/opt/dependency-cache/cargo" \
+          --env "CARGO_TARGET_DIR=/opt/dependency-cache/cargo-target" \
+          --env "CARGO_NET_OFFLINE=true" \
+          --env "RUSTUP_TOOLCHAIN=${rust_version}-x86_64-unknown-linux-gnu" \
+          --env "GOPATH=/opt/dependency-cache/go" \
+          --env "GOMODCACHE=/opt/dependency-cache/go/pkg/mod" \
+          --env "GOCACHE=/opt/dependency-cache/go-build" \
+          --env "GOPROXY=off" \
+          --env "MAVEN_USER_HOME=/opt/dependency-cache/m2" \
+          --env "MAVEN_OPTS=-Dmaven.repo.local=/opt/dependency-cache/m2/repository" \
+          --env "COURSIER_CACHE=/opt/dependency-cache/coursier/cache" \
+          --env "COURSIER_ARCHIVE_CACHE=/opt/dependency-cache/coursier/archive" \
+          --env "COURSIER_JVM_CACHE=/opt/dependency-cache/coursier/jvm" \
+          --env "COURSIER_CONFIG_DIR=/opt/dependency-cache/coursier/config" \
+          --env "COURSIER_DATA_DIR=/opt/dependency-cache/coursier/data" \
+          --env "JAVA_TOOL_OPTIONS=-Duser.home=/opt/dependency-cache/home -Dsbt.global.base=/opt/dependency-cache/sbt/global -Dsbt.boot.directory=/opt/dependency-cache/sbt/boot -Dsbt.ivy.home=/opt/dependency-cache/sbt/ivy -Dsbt.coursier.home=/opt/dependency-cache/coursier/cache -Dsbt.server.autostart=false -Dsbt.supershell=false -Dsbt.color=false -Dsbt.log.noformat=true" \
+          --env "SBT_OPTS=-Duser.home=/opt/dependency-cache/home -Dsbt.global.base=/opt/dependency-cache/sbt/global -Dsbt.boot.directory=/opt/dependency-cache/sbt/boot -Dsbt.ivy.home=/opt/dependency-cache/sbt/ivy -Dsbt.coursier.home=/opt/dependency-cache/coursier/cache -Dsbt.server.autostart=false -Dsbt.supershell=false -Dsbt.color=false -Dsbt.log.noformat=true" \
+          --env "GRADLE_USER_HOME=/opt/dependency-cache/gradle" \
+          --env "GRADLE_OPTS=-Dorg.gradle.workers.max=2 -Dorg.gradle.daemon=false" \
+          --env "AUTOAPI_GRADLE_PREFETCH_PROJECTS=${gradle_prefetch_projects}" \
+          --env "AUTOAPI_GRADLE_PREFETCH_TASKS=${gradle_prefetch_tasks}" \
+          --env "NUGET_PACKAGES=/opt/dependency-cache/nuget" \
+          --env "COMPOSER_HOME=/opt/dependency-cache/composer-home" \
+          --env "COMPOSER_CACHE_DIR=/opt/dependency-cache/composer-cache" \
+          --env "COMPOSER_ROOT_VERSION=${composer_root_version}" \
+          --env "SYMFONY_PHPUNIT_DIR=/opt/dependency-cache/symfony-phpunit" \
+          --env "BUNDLE_PATH=/opt/dependency-cache/bundle" \
+          --env "PUB_CACHE=/opt/dependency-cache/pub" \
+          --env "MIX_HOME=/opt/dependency-cache/mix" \
+          --env "HEX_HOME=/opt/dependency-cache/hex" \
+          --env "MIX_ENV=test" \
+          --env "HEX_OFFLINE=1" \
+          --env "CLJ_CONFIG=/opt/dependency-cache/clojure" \
+          --env "LEIN_HOME=/opt/dependency-cache/lein" \
+          --env "VCPKG_DISABLE_METRICS=1" \
+          --env "LEIN_JVM_OPTS=-Duser.home=/opt/dependency-cache/home" \
+          --env "PIP_CACHE_DIR=/opt/dependency-cache/pip" \
+          --env "MANAGER_NAME=${manager_name}" \
+          --env "MANAGER_VERSION=${manager_version}" \
+          --env "MANAGER_VARIANT=${manager_variant}" \
+          --env "MANAGER_SPEC=${manager_spec}" \
+          --env "MANAGER_LOCKFILE=${manager_lockfile}" \
+          --env "PYTHON_VERSION=${python_version}" \
+          --env "RUNTIME_VERSION=${runtime_version}" \
+          --env "ERLANG_VERSION=${erlang_version}" \
+          --env "SCALA_VERSION=${scala_version}" \
+          --env "COURSIER_VERSION=${coursier_version}" \
+          --env "HEX_VERSION=${hex_version}" \
+          --env "HEX_ARCHIVE_URL=${hex_archive_url}" \
+          --env "HEX_ARCHIVE_SHA512=${hex_archive_sha512}" \
+          --env "REBAR3_VERSION=${rebar3_version}" \
+          --env "REBAR3_ARCHIVE_URL=${rebar3_archive_url}" \
+          --env "REBAR3_ARCHIVE_SHA512=${rebar3_archive_sha512}" \
+          --env "AUTOMATED_API_ELIXIR_TOOL_PROOF=/opt/dependency-cache/elixir-tools/verified-tools" \
+          --env "AUTOMATED_API_RESOLVED_PYTHON_VERSION=${python_version}" \
+          --env "LOCKFILE_BEFORE_SHA256=${lockfile_before_sha256}" \
+          --env "RUNNER_IMAGE_ID=${runner_image_id}" \
+          --env "RUNTIME_IMAGES_JSON=${runtime_images_json}" \
+          --env "CERTIFICATION_HEAD=${certification_head}" \
+          --env "CERTIFICATION_TREE=${certification_tree}" \
+          --env "REPOSITORY_LANGUAGE=$(node -e 'const j=require(process.argv[1]);process.stdout.write(j.changeEvent.affectedLanguages.length===1?j.changeEvent.affectedLanguages[0]:"")' "${JOB_PATH}")" \
+          --env "AUTOMATED_API_PYTHON=/usr/local/bin/python" \
+          --env "AUTOMATED_API_VCPKG=/opt/dependency-cache/vcpkg/vcpkg" \
+          --env "AUTOMATED_API_CC=cc" \
+          --env "AUTOMATED_API_VCPKG_COMMIT_FILE=/opt/dependency-cache/vcpkg/.autoapi-vcpkg-commit" \
+          --env "AUTOMATED_API_VCPKG_RESOLVED_MANIFEST=/opt/dependency-resolution/${manager_directory}/vcpkg.json" \
+          --env "AUTOMATED_API_VCPKG_PROJECTION_MANIFEST=/opt/dependency-source/vcpkg.json" \
+          "${runner_image}" \
+          sh -c 'set -eu; export PATH="/opt/dependency-cache/coursier/bin:/opt/dependency-cache/uv-tool/bin:/opt/automated-api/node_modules/.bin:$PATH"; mkdir -p "$HOME";
+          case "$MANAGER_VARIANT" in
+            analysis-only) [ "$MANAGER_NAME" = none ] ;;
+            npm)
+              npm_cli=/opt/dependency-cache/npm-manager/node_modules/npm/bin/npm-cli.js;
+              [ "$(node "$npm_cli" --version)" = "$MANAGER_VERSION" ];
+              node "$npm_cli" ci --offline --ignore-scripts --no-audit --no-fund ;;
+            pnpm)
+              [ "$(corepack pnpm --version)" = "$MANAGER_VERSION" ];
+              corepack pnpm install --prefer-offline --prod=false --frozen-lockfile --ignore-scripts --store-dir /opt/dependency-cache/pnpm ;;
+            yarn-classic)
+              [ "$(corepack yarn --version)" = "$MANAGER_VERSION" ];
+              corepack yarn install --offline --frozen-lockfile --production=false --ignore-scripts --cache-folder /opt/dependency-cache/yarn-classic ;;
+            yarn-berry)
+              [ "$(corepack yarn --version)" = "$MANAGER_VERSION" ];
+              corepack yarn install --immutable --mode=skip-build ;;
+            python-pip)
+              [ "$(python --version 2>&1)" = "Python $PYTHON_VERSION" ];
+              rm -rf /opt/dependency-cache/python-certification;
+              python -m pip install --require-hashes --no-index --find-links /opt/dependency-cache/python-wheels --only-binary=:all: --target /opt/dependency-cache/python-certification --requirement "$MANAGER_LOCKFILE" ;;
+            python-uv)
+              [ "$(python --version 2>&1)" = "Python $PYTHON_VERSION" ];
+              [ "$(uv --version | awk "{print \$2}")" = "$MANAGER_VERSION" ];
+              if [ -f /opt/dependency-cache/python-build-inputs/selection.json ]; then
+                python -I /opt/automated-api/scripts/lib/python-certified-environment.py certify \
+                  "$PWD" /opt/dependency-cache /input/job.json uv /opt/python-certified-cache;
+              else
+                uv sync --offline --frozen --no-install-workspace --no-build --python "$PYTHON_VERSION";
+              fi ;;
+            python-stdlib) [ "$(python --version 2>&1)" = "Python $PYTHON_VERSION" ] ;;
+            rust-cargo)
+              [ "$(cargo --version | awk "{print \$2}")" = "$MANAGER_VERSION" ];
+              cargo metadata --offline --frozen --format-version 1 --no-deps > /dev/null ;;
+            go-modules)
+              [ "$(go version | awk "{print \$3}")" = "go$MANAGER_VERSION" ];
+              go mod verify ;;
+            jvm-maven)
+              maven_root="$PWD";
+              while [ ! -x "$maven_root/mvnw" ] && [ "$maven_root" != /workspace ]; do maven_root="$(dirname "$maven_root")"; done;
+              maven_wrapper="$maven_root/mvnw";
+              [ -x "$maven_wrapper" ];
+              [ "$("$maven_wrapper" --version | grep -oE "[0-9]+([.][0-9]+)+" | head -1)" = "$MANAGER_VERSION" ];
+              "$maven_wrapper" -o -B -DskipTests dependency:go-offline ;;
+            jvm-gradle)
+              gradle_root="$(pwd -P)";
+              case "$gradle_root" in /workspace|/workspace/*) ;; *) exit 1;; esac;
+              while [ ! -x "$gradle_root/gradlew" ] && [ "$gradle_root" != /workspace ]; do gradle_root="$(dirname "$gradle_root")"; done;
+              gradle_wrapper="$gradle_root/gradlew";
+              [ -x "$gradle_wrapper" ];
+              [ ! -L "$gradle_wrapper" ];
+              [ "$("$gradle_wrapper" --version | sed -n "s/^Gradle //p" | head -1)" = "$MANAGER_VERSION" ];
+              if [ "$AUTOAPI_GRADLE_PREFETCH_TASKS" = \* ]; then
+                "$gradle_wrapper" --offline --no-daemon --no-parallel "-Pkotlin.compiler.execution.strategy=in-process" --init-script /opt/autoapi-runtime/gradle-dependency-prefetch.init.gradle autoApiPrefetchDependencies;
+              else
+                env AUTOAPI_GRADLE_PREFETCH_TASK_GRAPH=1 "$gradle_wrapper" --offline --no-daemon --no-parallel "-Pkotlin.compiler.execution.strategy=in-process" --init-script /opt/autoapi-runtime/gradle-dependency-prefetch.init.gradle --dry-run autoApiPrefetchValidationDependencies;
+              fi ;;
+            scala-sbt)
+              export PATH="/opt/dependency-cache/coursier/bin:$PATH";
+              [ "$(cs version)" = "$COURSIER_VERSION" ];
+              sbt_version_output="$(cs launch --mode offline "sbt:${MANAGER_VERSION}" -- "show sbtVersion")";
+              [ "$(printf "%s\n" "$sbt_version_output" | grep -E "^\[info\] [0-9]+([.][0-9]+)+$" | cut -d " " -f2 | sort -u)" = "$MANAGER_VERSION" ];
+              cs launch --mode offline "sbt:${MANAGER_VERSION}" -- update ;;
+            dotnet-nuget)
+              [ "$(dotnet --version)" = "$MANAGER_VERSION" ]; dotnet restore --locked-mode --ignore-failed-sources --packages "$NUGET_PACKAGES" -p:EnableWindowsTargeting=true ;;
+            php-composer)
+              [ "$(composer --version --no-ansi | awk "{print \$3}")" = "$MANAGER_VERSION" ];
+              composer install --dry-run --no-interaction --no-plugins --no-scripts ;;
+            ruby-bundler)
+              [ "$(bundle "_${MANAGER_VERSION}_" --version | awk "{print \$3}")" = "$MANAGER_VERSION" ]; bundle "_${MANAGER_VERSION}_" check ;;
+            swift-package)
+              swift_actual="$(swift --version | grep -oE "[0-9]+([.][0-9]+)+" | head -1)";
+              case "$MANAGER_VERSION" in "$swift_actual"|"$swift_actual.0") ;; *) exit 1 ;; esac;
+              swift package --only-use-versions-from-resolved-file show-dependencies > /dev/null ;;
+            dart-pub)
+              [ "$(dart --version 2>&1 | grep -oE "[0-9]+([.][0-9]+)+" | head -1)" = "$MANAGER_VERSION" ]; dart pub get --offline ;;
+            elixir-mix)
+              [ "$(elixir --version | grep "^Elixir " | cut -d " " -f2)" = "$RUNTIME_VERSION" ];
+              [ "$(mix --version | grep "^Mix " | cut -d " " -f2)" = "$MANAGER_VERSION" ];
+              printf "%s  %s\n" "$HEX_ARCHIVE_SHA512" /opt/dependency-cache/elixir-tools/hex.ez | sha512sum --check --status;
+              printf "%s  %s\n" "$REBAR3_ARCHIVE_SHA512" /opt/dependency-cache/elixir-tools/rebar3 | sha512sum --check --status;
+              hex_info="$(mix hex.info)" || { printf "%s\n" "Hex version command failed" >&2; exit 1; };
+              hex_actual="$(printf "%s\n" "$hex_info" | sed -n "s/^Hex:[[:space:]]*//p" | head -1)";
+              [ "$hex_actual" = "$HEX_VERSION" ] || { printf "Hex version mismatch: expected %s, found %s\n" "$HEX_VERSION" "${hex_actual:-<missing>}" >&2; exit 1; };
+              elixir_minor="$(printf "%s" "$RUNTIME_VERSION" | cut -d. -f1-2 | tr . -)"; otp_major="${ERLANG_VERSION%%.*}";
+              local_rebar3="$MIX_HOME/elixir/${elixir_minor}-otp-${otp_major}/rebar3";
+              [ "$("$local_rebar3" version | grep -oE "[0-9]+([.][0-9]+){2}" | head -1)" = "$REBAR3_VERSION" ];
+              printf "%s\n%s\n%s\n%s\n%s\n%s\n" "$HEX_VERSION" "$HEX_ARCHIVE_URL" "$HEX_ARCHIVE_SHA512" "$REBAR3_VERSION" "$REBAR3_ARCHIVE_URL" "$REBAR3_ARCHIVE_SHA512" > /opt/dependency-cache/elixir-tools/verified-tools.part;
+              mv /opt/dependency-cache/elixir-tools/verified-tools.part /opt/dependency-cache/elixir-tools/verified-tools;
+              mix deps.get --only test ;;
+            clojure-tools-deps)
+              [ "$(clojure -Sdescribe | grep -oE "[0-9]+([.][0-9]+)+" | head -1)" = "$MANAGER_VERSION" ];
+              [ "$(clojure -Srepro -M -e "(print (clojure-version))")" = "$RUNTIME_VERSION" ];
+              clojure -Soffline -P ;;
+            clojure-leiningen)
+              [ "$(lein version | grep -oE "[0-9]+([.][0-9]+)+" | head -1)" = "$MANAGER_VERSION" ];
+              [ "$(lein -o update-in :prep-tasks empty -- trampoline run -m clojure.main -e "(print (clojure-version))" | grep -E "^[0-9]+([.][0-9]+)+$" | tail -1)" = "$RUNTIME_VERSION" ];
+              lein -o deps ;;
+            c-vcpkg|cpp-vcpkg)
+              [ "$MANAGER_NAME" = vcpkg ];
+              [ "$(cat /opt/dependency-cache/vcpkg/.autoapi-vcpkg-commit)" = "$MANAGER_VERSION" ];
+              /opt/dependency-cache/vcpkg/vcpkg install --x-manifest-root=/opt/dependency-source --dry-run \
+                --x-install-root=/opt/dependency-cache/vcpkg-prefetch-installed \
+                --downloads-root=/opt/dependency-cache/vcpkg-downloads \
+                --x-buildtrees-root=/opt/dependency-cache/vcpkg-buildtrees \
+                --binarysource=clear\;files,/opt/dependency-cache/vcpkg-binary,read ;;
+            *) exit 2 ;;
+          esac'
+        certification_manager_container=""
+
+        # The customer package-manager process is gone before trusted
+        # verification begins. The fresh container cannot mutate the exact
+        # source, Action runtime, dependency cache, or its own root filesystem.
+        # Manager commands were already checked above, so certificate creation
+        # never re-executes a repository-owned wrapper or project task.
+        certification_verifier_container="autoapi-cert-verifier-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        docker run --rm --name "${certification_verifier_container}" --network none \
+          --user "${certification_runtime_uid}:${certification_runtime_gid}" \
+          --read-only --cap-drop ALL --security-opt no-new-privileges \
+          --memory 1g --cpus 1 --pids-limit 128 \
+          --tmpfs /tmp:rw,exec,nosuid,nodev,size=67108864 \
+          --mount "type=bind,src=${runner_source},dst=/opt/automated-api,readonly" \
+          --mount "type=bind,src=${dependency_cache},dst=/opt/dependency-cache,readonly" \
+          --mount "type=bind,src=${python_certified_cache},dst=/opt/python-certified-cache,readonly" \
+          --mount "type=bind,src=${dependency_source},dst=/opt/dependency-source,readonly" \
+          --mount "type=bind,src=${resolution_source},dst=/opt/dependency-resolution,readonly" \
+          --mount "type=bind,src=${certification_source},dst=/workspace,readonly" \
+          --mount "type=bind,src=${JOB_PATH},dst=/input/job.json,readonly" \
+          --mount "type=bind,src=${OUTPUT_DIRECTORY},dst=/output" \
+          --workdir "${manager_workdir}" \
+          --env "HOME=/tmp/automated-api-home" \
+          --env "PATH=/opt/java/openjdk/bin:/usr/local/cargo/bin:/usr/local/go/bin:/usr/local/swift/usr/bin:/usr/lib/dart/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+          --env "MANAGER_NAME=${manager_name}" \
+          --env "MANAGER_VERSION=${manager_version}" \
+          --env "MANAGER_VARIANT=${manager_variant}" \
+          --env "MANAGER_SPEC=${manager_spec}" \
+          --env "MANAGER_LOCKFILE=${manager_lockfile}" \
+          --env "PYTHON_VERSION=${python_version}" \
+          --env "RUNTIME_VERSION=${runtime_version}" \
+          --env "ERLANG_VERSION=${erlang_version}" \
+          --env "SCALA_VERSION=${scala_version}" \
+          --env "COURSIER_VERSION=${coursier_version}" \
+          --env "HEX_VERSION=${hex_version}" \
+          --env "HEX_ARCHIVE_URL=${hex_archive_url}" \
+          --env "HEX_ARCHIVE_SHA512=${hex_archive_sha512}" \
+          --env "REBAR3_VERSION=${rebar3_version}" \
+          --env "REBAR3_ARCHIVE_URL=${rebar3_archive_url}" \
+          --env "REBAR3_ARCHIVE_SHA512=${rebar3_archive_sha512}" \
+          --env "MIX_HOME=/opt/dependency-cache/mix" \
+          --env "RUNNER_IMAGE_ID=${runner_image_id}" \
+          --env "RUNTIME_IMAGES_JSON=${runtime_images_json}" \
+          --env "LOCKFILE_BEFORE_SHA256=${lockfile_before_sha256}" \
+          --env "CERTIFICATION_HEAD=${certification_head}" \
+          --env "CERTIFICATION_TREE=${certification_tree}" \
+          --env "REPOSITORY_LANGUAGE=$(node -e 'const j=require(process.argv[1]);process.stdout.write(j.changeEvent.affectedLanguages.length===1?j.changeEvent.affectedLanguages[0]:"")' "${JOB_PATH}")" \
+          --env "AUTOMATED_API_MANAGER_EXECUTION_VERIFIED=1" \
+          --env "AUTOMATED_API_PYTHON=/usr/local/bin/python" \
+          --env "AUTOMATED_API_ELIXIR_TOOL_PROOF=/opt/dependency-cache/elixir-tools/verified-tools" \
+          --env "AUTOMATED_API_VCPKG=/opt/dependency-cache/vcpkg/vcpkg" \
+          --env "AUTOMATED_API_CC=cc" \
+          --env "AUTOMATED_API_VCPKG_COMMIT_FILE=/opt/dependency-cache/vcpkg/.autoapi-vcpkg-commit" \
+          --env "AUTOMATED_API_VCPKG_RESOLVED_MANIFEST=/opt/dependency-resolution/${manager_directory}/vcpkg.json" \
+          --env "AUTOMATED_API_VCPKG_PROJECTION_MANIFEST=/opt/dependency-source/vcpkg.json" \
+          "${runner_image}" \
+          sh -c 'set -eu;
+          mkdir -p "$HOME";
+          # CERTIFICATION_SOURCE_POST_OFFLINE_INTEGRITY_BEGIN
+          trusted_git=/usr/bin/git;
+          [ -x "$trusted_git" ];
+          git_environment="GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_NO_REPLACE_OBJECTS=1 GIT_DIR=/workspace/.git GIT_WORK_TREE=/workspace";
+          [ "$(env $git_environment "$trusted_git" rev-parse HEAD)" = "$CERTIFICATION_HEAD" ];
+          [ "$(env $git_environment "$trusted_git" rev-parse HEAD^{tree})" = "$CERTIFICATION_TREE" ];
+          /usr/local/bin/node /opt/automated-api/scripts/lib/verify-exact-worktree.mjs verify \
+            /workspace "$CERTIFICATION_TREE" /opt/automated-api/.autoapi-certification-source.json;
+          # CERTIFICATION_SOURCE_POST_OFFLINE_INTEGRITY_END
+          if [ -f /opt/python-certified-cache/python-certified.json ]; then export AUTOMATED_API_PYTHON_CERTIFIED_RECEIPT=/opt/python-certified-cache/python-certified.json; fi;
+          exec /usr/local/bin/node /opt/automated-api/packages/runner/dist/toolchainCertificationCli.js \
+            /input/job.json /workspace /output/toolchain-certification.json'
+        certification_verifier_container=""
+
+        # A deferred Dart pass has no early result. On normal re-entry, consume
+        # its supplied Harness result only after the same offline certification.
+        if [ "${analysis_result_status}" = harness_required ] || { [ "${dart_analysis_deferred}" = 1 ] && [ -n "${harness_result_path}" ]; }; then
+          if [ -n "${harness_wait_pid}" ]; then
+            if ! wait "${harness_wait_pid}"; then
+              harness_wait_pid=""
+              [ ! -s "${harness_wait_error}" ] || cat "${harness_wait_error}" >&2
+              exit 1
+            fi
+            harness_wait_pid=""
+          else
+            wait_for_harness_result
+          fi
+          test -s "${harness_result_path}"
+          harness_mount+=(--mount "type=bind,src=${harness_result_path},dst=/input/harness-result.json,readonly")
+        fi
+
+        # The first analysis invocation committed a trusted preliminary result.
+        # Remove only that owned regular file so the final invocation can use
+        # create-only publication and detect any validation-command collision.
+        if [ -n "${analysis_result_status}" ]; then
+          remove_preliminary_runner_result
+        fi
+
+        # CUSTOMER_SOURCE_RAW_INTEGRITY_VERIFY_BEGIN
+        # Git's clean filters, info attributes, EOL conversion and index flags
+        # can all make changed bytes appear clean. Re-read the complete raw
+        # workspace (excluding only .git) immediately before the intentional
+        # final proposal mutation phase.
+        docker run --rm --network none --user "$(id -u):$(id -g)" \
+          --read-only --cap-drop ALL --security-opt no-new-privileges \
+          --mount "type=bind,src=${GITHUB_WORKSPACE},dst=/workspace,readonly" \
+          --mount "type=bind,src=${runner_source},dst=/opt/automated-api,readonly" \
+          "${analysis_image}" /usr/local/bin/node \
+            /opt/automated-api/scripts/lib/verify-exact-worktree.mjs verify \
+            /workspace "${customer_source_tree}" "${customer_source_manifest}"
+        # CUSTOMER_SOURCE_RAW_INTEGRITY_VERIFY_END
+
+        docker run --rm --network none --user "$(id -u):$(id -g)" \
+          ${maven_wrapper_cache_environment[@]+"${maven_wrapper_cache_environment[@]}"} \
+          --mount "type=bind,src=${runner_source},dst=/opt/automated-api,readonly" \
+          --mount "type=bind,src=${dependency_cache},dst=/opt/dependency-cache" \
+          --mount "type=bind,src=${python_certified_cache},dst=/opt/python-certified-cache,readonly" \
+          --mount "type=bind,src=${dependency_source},dst=/opt/dependency-source,readonly" \
+          --mount "type=bind,src=${GITHUB_WORKSPACE},dst=/workspace" \
+          --mount "type=bind,src=${JOB_PATH},dst=/input/job.json,readonly" \
+          --mount "type=bind,src=${OUTPUT_DIRECTORY}/toolchain-certification.json,dst=/input/toolchain-certification.json,readonly" \
+          --mount "type=bind,src=${OUTPUT_DIRECTORY},dst=/output" \
+          ${harness_mount[@]+"${harness_mount[@]}"} \
+          --workdir /workspace \
+          --env "HOME=/opt/dependency-cache/home" \
+          --env "npm_config_cache=/opt/dependency-cache/npm" \
+          --env "pnpm_config_store_dir=/opt/dependency-cache/pnpm" \
+          --env "npm_config_ignore_pnpmfile=true" \
+          --env "XDG_CACHE_HOME=/opt/dependency-cache/xdg-cache" \
+          --env "YARN_CACHE_FOLDER=/opt/dependency-cache/yarn-classic" \
+          --env "COREPACK_HOME=/opt/dependency-cache/corepack" \
+          --env "COREPACK_ENABLE_NETWORK=0" \
+          --env "YARN_ENABLE_NETWORK=0" \
+          --env "YARN_ENABLE_GLOBAL_CACHE=true" \
+          --env "YARN_GLOBAL_FOLDER=/opt/dependency-cache/yarn-berry" \
+          --env "YARN_ENABLE_SCRIPTS=false" \
+          --env "YARN_IGNORE_PATH=1" \
+          --env "YARN_ENABLE_CONSTRAINTS_CHECKS=false" \
+          --env "UV_CACHE_DIR=/opt/dependency-cache/uv" \
+          --env "CARGO_HOME=/opt/dependency-cache/cargo" \
+          --env "CARGO_TARGET_DIR=/opt/dependency-cache/cargo-target" \
+          --env "CARGO_BUILD_JOBS=2" \
+          --env "CARGO_NET_OFFLINE=true" \
+          --env "RUSTUP_TOOLCHAIN=${rust_version}-x86_64-unknown-linux-gnu" \
+          --env "GOPATH=/opt/dependency-cache/go" \
+          --env "GOMODCACHE=/opt/dependency-cache/go/pkg/mod" \
+          --env "GOCACHE=/opt/dependency-cache/go-build" \
+          --env "GOPROXY=off" \
+          --env "MAVEN_USER_HOME=/opt/dependency-cache/m2" \
+          --env "MAVEN_OPTS=-Dmaven.repo.local=/opt/dependency-cache/m2/repository" \
+          --env "COURSIER_CACHE=/opt/dependency-cache/coursier/cache" \
+          --env "COURSIER_ARCHIVE_CACHE=/opt/dependency-cache/coursier/archive" \
+          --env "COURSIER_JVM_CACHE=/opt/dependency-cache/coursier/jvm" \
+          --env "COURSIER_CONFIG_DIR=/opt/dependency-cache/coursier/config" \
+          --env "COURSIER_DATA_DIR=/opt/dependency-cache/coursier/data" \
+          --env "JAVA_TOOL_OPTIONS=-Duser.home=/opt/dependency-cache/home -Dsbt.global.base=/opt/dependency-cache/sbt/global -Dsbt.boot.directory=/opt/dependency-cache/sbt/boot -Dsbt.ivy.home=/opt/dependency-cache/sbt/ivy -Dsbt.coursier.home=/opt/dependency-cache/coursier/cache -Dsbt.server.autostart=false -Dsbt.supershell=false -Dsbt.color=false -Dsbt.log.noformat=true" \
+          --env "SBT_OPTS=-Duser.home=/opt/dependency-cache/home -Dsbt.global.base=/opt/dependency-cache/sbt/global -Dsbt.boot.directory=/opt/dependency-cache/sbt/boot -Dsbt.ivy.home=/opt/dependency-cache/sbt/ivy -Dsbt.coursier.home=/opt/dependency-cache/coursier/cache -Dsbt.server.autostart=false -Dsbt.supershell=false -Dsbt.color=false -Dsbt.log.noformat=true" \
+          --env "GRADLE_USER_HOME=/opt/dependency-cache/gradle" \
+          --env "GRADLE_OPTS=-Dorg.gradle.workers.max=2 -Dorg.gradle.daemon=false" \
+          --env "AUTOAPI_GRADLE_PREFETCH_PROJECTS=${gradle_prefetch_projects}" \
+          --env "AUTOAPI_GRADLE_PREFETCH_TASKS=${gradle_prefetch_tasks}" \
+          --env "NUGET_PACKAGES=/opt/dependency-cache/nuget" \
+          --env "COMPOSER_HOME=/opt/dependency-cache/composer-home" \
+          --env "COMPOSER_CACHE_DIR=/opt/dependency-cache/composer-cache" \
+          --env "COMPOSER_ROOT_VERSION=${composer_root_version}" \
+          --env "SYMFONY_PHPUNIT_DIR=/opt/dependency-cache/symfony-phpunit" \
+          --env "BUNDLE_PATH=/opt/dependency-cache/bundle" \
+          --env "PUB_CACHE=/opt/dependency-cache/pub" \
+          --env "MIX_HOME=/opt/dependency-cache/mix" \
+          --env "HEX_HOME=/opt/dependency-cache/hex" \
+          --env "MIX_ENV=test" \
+          --env "HEX_OFFLINE=1" \
+          --env "CLJ_CONFIG=/opt/dependency-cache/clojure" \
+          --env "LEIN_HOME=/opt/dependency-cache/lein" \
+          --env "LEIN_JVM_OPTS=-Duser.home=/opt/dependency-cache/home" \
+          --env "PIP_DEFAULT_TIMEOUT=60" \
+          --env "PIP_RETRIES=10" \
+          --env "PIP_CACHE_DIR=/opt/dependency-cache/pip" \
+          --env "PYTHONPATH=/opt/dependency-cache/python-site" \
+          --env "TIKTOKEN_CACHE_DIR=/opt/dependency-cache/tiktoken" \
+          --env "AUTOMATED_API_PYTHON=/usr/local/bin/python" \
+          --env "AUTOMATED_API_RESOLVED_PYTHON_VERSION=${python_version}" \
+          --env "MANAGER_VARIANT=${manager_variant}" \
+          --env "MANAGER_VERSION=${manager_version}" \
+          --env "MANAGER_DIRECTORY=${manager_directory}" \
+          --env "AUTOMATED_API_TOOLCHAIN_CERTIFICATE=/input/toolchain-certification.json" \
+          --env "AUTOMATED_API_RESOLVED_LOCKFILE=${resolved_lockfile}" \
+          --env "AUTOMATED_API_GOIMPORTS=/opt/dependency-cache/go-tools/goimports" \
+          --env "AUTOMATED_API_VCPKG=/opt/dependency-cache/vcpkg/vcpkg" \
+          --env "AUTOMATED_API_CC=cc" \
+          --env "AUTOMATED_API_VCPKG_COMMIT_FILE=/opt/dependency-cache/vcpkg/.autoapi-vcpkg-commit" \
+          --env "VCPKG_DISABLE_METRICS=1" \
+          --env "VCPKG_ROOT=/opt/dependency-cache/vcpkg" \
+          --env "VCPKG_INSTALLED_DIR=/opt/dependency-cache/vcpkg-prefetch-installed" \
+          --env "CMAKE_TOOLCHAIN_FILE=/opt/dependency-cache/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+          "${runner_image}" \
+          sh -c 'set -eu; export PATH="/workspace/.venv/bin:/opt/dependency-cache/coursier/bin:/opt/dependency-cache/go-tools:/opt/dependency-cache/uv-tool/bin:/opt/automated-api/node_modules/.bin:$PATH"; /bin/mkdir -p "$HOME"; if [ -f /opt/python-certified-cache/python-certified.json ]; then export AUTOMATED_API_PYTHON_CERTIFIED_CACHE=/opt/python-certified-cache; fi;
+          if [ "$MANAGER_VARIANT" = dart-pub ]; then
+            dart_version_output="$(PATH=/usr/lib/dart/bin:/usr/local/bin:/usr/bin:/bin DART_SUPPRESS_ANALYTICS=true /usr/lib/dart/bin/dart --version 2>&1)";
+            case "$dart_version_output" in "Dart SDK version: $MANAGER_VERSION "*) ;; *) exit 2;; esac;
+            dart_manager_root="$(/usr/bin/realpath -e "/workspace/$MANAGER_DIRECTORY")";
+            case "$dart_manager_root" in /workspace|/workspace/*) ;; *) exit 2;; esac;
+            (cd "$dart_manager_root" && PATH=/usr/lib/dart/bin:/usr/local/bin:/usr/bin:/bin DART_SUPPRESS_ANALYTICS=true /usr/lib/dart/bin/dart pub get --offline);
+          fi;
+          if [ -f /input/harness-result.json ]; then exec /usr/local/bin/node /opt/automated-api/packages/runner/dist/cli.js /input/job.json /workspace /output /input/harness-result.json; else exec /usr/local/bin/node /opt/automated-api/packages/runner/dist/cli.js /input/job.json /workspace /output; fi'
+        final_runner_completed=1
+
+        echo "output_directory=${OUTPUT_DIRECTORY}" >> "${GITHUB_OUTPUT}"

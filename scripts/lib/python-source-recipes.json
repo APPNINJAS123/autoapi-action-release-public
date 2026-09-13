@@ -1,0 +1,15 @@
+{
+  "sourceDateEpoch": "1735689600",
+  "uvBootstrap": {"name":"uv","version":"0.12.5","kind":"wheel","filename":"uv-0.12.5-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl","sha256":"3e195ccf1ed60c8bb24a6447ce306441a4181d54b602407e09bc56e963911c15","size":23657089,"url":"https://files.pythonhosted.org/packages/93/22/dacc9a0bc8604187a1ba954a3aef8329e4104eb0af772d2c3c634893bd9b/uv-0.12.5-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"},
+  "tokenizerData": {"url":"https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken","sha256":"223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7","maximumBytes":4194304},
+  "recipes": [
+    {"name":"fire","version":"0.7.0","sourceSha256":"961550f07936eaf65ad1dc8360f2b2bf8408fad46abbfa4d2a3794f8d2a95cdf","wheel":"fire-0.7.0-py3-none-any.whl","wheelSha256":"47d45a2efe532d45ef70580e8e51467cb130c02c6e174846ec1190c24d958b04"},
+    {"name":"halo","version":"0.0.31","sourceSha256":"7b67a3521ee91d53b7152d4ee3452811e1d2a6321975137762eb3d70063cc9d6","wheel":"halo-0.0.31-py3-none-any.whl","wheelSha256":"92aaf289e927e3d5e5e7857676d20839e41cff2467989da4146ef1465464f938"},
+    {"name":"wget","version":"3.2","sourceSha256":"35e630eca2aa50ce998b9b1a127bb26b30dfee573702782aa982f875e3f16061","wheel":"wget-3.2-py3-none-any.whl","wheelSha256":"bf054e4da7c6f2be9f2d0ac8fc1c57272f3f396c0f771c630a5074d6c56a0b7c"}
+  ],
+  "buildTools": [
+    {"filename":"setuptools-80.9.0-py3-none-any.whl","sha256":"062d34222ad13e0cc312a4c02d73f059e86a4acbfbdea8f8f76b28c99f306922","size":1201486,"url":"https://files.pythonhosted.org/packages/a3/dc/17031897dae0efacfea57dfd3a82fdd2a2aeb58e0ff71b77b87e44edc772/setuptools-80.9.0-py3-none-any.whl"},
+    {"filename":"wheel-0.45.1-py3-none-any.whl","sha256":"708e7481cc80179af0e556bbf0cc00b8444c7321e2700b8d8580231d13017248","size":72494,"url":"https://files.pythonhosted.org/packages/0b/2c/87f3254fd8ffd29e4c02732eee68a83a1d3c346ae39bc6822dcbcb697f2b/wheel-0.45.1-py3-none-any.whl"},
+    {"filename":"packaging-25.0-py3-none-any.whl","sha256":"29572ef2b1f17581046b3a2227d5c611fb25ec70ca1ba8554b24b0e69331a484","size":66469,"url":"https://files.pythonhosted.org/packages/20/12/38679034af332785aac8774540895e234f4d07f7545804097de4b666afd8/packaging-25.0-py3-none-any.whl"}
+  ]
+}
