@@ -89,6 +89,7 @@ import {
   reviewedDockershrinkClientSeed,
   reviewedDockershrinkClientSeedEdits,
   reviewedDockershrinkClientViolations,
+  reviewedDockershrinkModelFiles,
   reviewedDockershrinkModelPolicy,
 } from './reviewedDockershrinkClient.js'
 
@@ -260,7 +261,12 @@ export class ProposalRunner {
             : instructionSeedEnabled
               ? verifiedInstructionHarnessSeedEdits(readableFiles, impact, job.changeEvent)
               : []
-      const unresolvedFiles = overlaySeedEdits(readableFiles, seedEdits)
+      const seededFiles = overlaySeedEdits(readableFiles, seedEdits)
+      // The exact Dockershrink pointer adapter is a complete code-owned source
+      // edit, not a compatibility question for the hosted model. Omitting that
+      // one file from the request prevents a valid seed from being reformatted
+      // or redundantly returned while the Harness migrates the actual SDK calls.
+      const unresolvedFiles = reviewedDockershrinkModelFiles(reviewedDockershrinkClient, seededFiles)
       if (candidateFiles.length > 0 && unresolvedFiles.length === 0) {
         return {
           status: 'blocked',
@@ -449,7 +455,7 @@ export class ProposalRunner {
         baseSha: job.baseSha, changeEventId: job.changeEvent.id,
         repairAttempt: job.repairAttempt, files: validatedBoundaries,
       }
-      const proposedSources = unresolvedFiles.map(file => ({
+      const proposedSources = seededFiles.map(file => ({
         path: file.path,
         content: result.edits.find(edit => edit.path === file.path)?.content ?? file.content,
       }))

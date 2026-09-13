@@ -78,6 +78,14 @@ export function reviewedDockershrinkClientSeedEdits(
   return [{ path: file.path, expectedHash: observed, content }]
 }
 
+export function reviewedDockershrinkModelFiles<T extends { path: string }>(
+  contract: ReviewedDockershrinkClientSeed | undefined,
+  files: readonly T[],
+): T[] {
+  if (contract === undefined) return [...files]
+  return files.filter(file => file.path !== contract.sourcePath)
+}
+
 /** Separate the exact code-owned adapter from cumulative model repair edits. */
 export function partitionReviewedDockershrinkPreviousEdits(
   contract: ReviewedDockershrinkClientSeed | undefined,
