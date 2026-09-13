@@ -84,6 +84,13 @@ import {
   reviewedJavaHelperViolations,
 } from './reviewedJavaHelper.js'
 import { applyReviewedEmbabelKotlinRecipe } from './reviewedKotlinConsumer.js'
+import {
+  partitionReviewedDockershrinkPreviousEdits,
+  reviewedDockershrinkClientSeed,
+  reviewedDockershrinkClientSeedEdits,
+  reviewedDockershrinkClientViolations,
+  reviewedDockershrinkModelPolicy,
+} from './reviewedDockershrinkClient.js'
 
 const MAX_VALIDATION_CONTEXT_CHARACTERS = 8_000
 
@@ -118,7 +125,11 @@ export class ProposalRunner {
     }
     const restrictedJob = restrictProbableJob(parsedJob)
     const reviewedGradleLockMigration = reviewedDdTraceGradleLockMigration(restrictedJob)
-    const modelPolicy = reviewedDdTraceModelPolicy(restrictedJob)
+    const reviewedDockershrinkClient = reviewedDockershrinkClientSeed(restrictedJob)
+    const modelPolicy = reviewedDockershrinkModelPolicy(
+      restrictedJob,
+      reviewedDdTraceModelPolicy(restrictedJob),
+    )
     const job = bindReviewedRepositoryChangeEvent(restrictedJob)
     const commandBudget = job.deadlineAt === undefined
       ? undefined
@@ -213,11 +224,16 @@ export class ProposalRunner {
         || instructionSeedEnabled
         || repositoryImportSeed !== undefined
         || reviewedJavaHelper !== undefined
+        || reviewedDockershrinkClient !== undefined
       const partitionedPreviousEdits = partitionReviewedJavaHelperPreviousEdits(
         reviewedJavaHelper,
         job.repairContext?.previousEdits ?? [],
       )
-      const previousModelEdits = partitionedPreviousEdits.modelEdits.filter(edit =>
+      const partitionedDockershrinkEdits = partitionReviewedDockershrinkPreviousEdits(
+        reviewedDockershrinkClient,
+        partitionedPreviousEdits.modelEdits,
+      )
+      const previousModelEdits = partitionedDockershrinkEdits.modelEdits.filter(edit =>
         !hasCodeOwnedDependencyMigration || !isDependencyManifest(edit.path))
       const loaded = await loadUnresolvedFiles(
         rootDir,
@@ -235,6 +251,8 @@ export class ProposalRunner {
       const withheldSecretFiles = candidateFiles.length - readableFiles.length
       const seedEdits = reviewedJavaHelper !== undefined
         ? reviewedJavaHelperSeedEdits(reviewedJavaHelper, readableFiles)
+        : reviewedDockershrinkClient !== undefined
+          ? reviewedDockershrinkClientSeedEdits(reviewedDockershrinkClient, readableFiles)
         : firecrawlHybridSeedEnabled
           ? verifiedFirecrawlHarnessSeedEdits(readableFiles, impact, job.changeEvent)
           : repositoryImportSeed !== undefined
@@ -438,6 +456,7 @@ export class ProposalRunner {
       const reviewedRepositoryViolations = [
         ...reviewedSymfonyPredisMigrationViolations(job, proposedSources),
         ...reviewedJavaHelperViolations(reviewedJavaHelper, proposedSources),
+        ...reviewedDockershrinkClientViolations(reviewedDockershrinkClient, proposedSources),
       ]
       if (reviewedRepositoryViolations.length > 0) {
         return {
