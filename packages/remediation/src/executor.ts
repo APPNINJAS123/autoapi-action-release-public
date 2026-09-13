@@ -2024,6 +2024,7 @@ function buildPrompt(
     ] : []),
     ...(files.some(file => file.path.endsWith('.go')) ? [
       'GO TYPE-CHECK CHECKLIST: distinguish type declarations from value expressions. A declaration such as type Kind string defines a type, not a value usable as a struct field. Construct or omit a field only as justified by the exact supplied target declaration and serialization/default implementation; do not guess constants or copy old SDK identifiers.',
+      'When the exact old and target Go SDK evidence expose the same public identifier, preserve that identifier byte-for-byte. Do not derive or normalize a Go identifier from its wire string value, punctuation, date, or naming convention; only an explicit target declaration can justify changing its spelling.',
       ...(files.length > 1 && files.every(file => file.path.endsWith('.go')) ? [
         'GO CALLER/CALLEE COHORT: the supplied same-package files are one compiler-linked decision because one file references a declaration owned by another. Review their current hash-locked contents together and return one coherent set of edits; do not assume a parallel request will revise the shared declaration or caller later. Each file keeps its own editBoundaries, and the shared deadline, model-output cap, path policy, and whole-result validation are unchanged.',
       ] : []),
