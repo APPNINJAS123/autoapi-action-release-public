@@ -19,6 +19,11 @@ const BASE_SHA = '43a04bde446c5bf98a114f53165725677f4eea69'
 const EVENT_PROVENANCE = '15fe4ed06edf8eef1d0e15c3be5528094d6cf6a65f303d740168afea97374c9c'
 const OLD_CALL = 'return ai.NewAIService(logger, client, aiModel), true'
 const SEEDED_CALL = 'return ai.NewAIService(logger, &client, aiModel), true'
+const MODEL_WRITABLE_AI_PATHS = [
+  'internal/ai/generate.go',
+  'internal/ai/optimize.go',
+  'internal/ai/tools.go',
+] as const
 
 /**
  * Bind one mechanical pointer adapter to the exact reviewed Dockershrink job.
@@ -47,10 +52,16 @@ export function reviewedDockershrinkModelPolicy(
   const contract = reviewedDockershrinkClientSeed(jobInput)
   if (contract === undefined) return fallback
   const job = MigrationJobSchema.parse(jobInput)
-  const allowedPaths = fallback.allowedPaths.filter(path => path !== contract.sourcePath)
-  if (allowedPaths.length !== fallback.allowedPaths.length - 1
-    || !job.policy.modelReadablePaths?.includes(contract.sourcePath)) {
-    throw new Error('reviewed Dockershrink client seed is not an exact readable policy path')
+  const allowedPaths = fallback.allowedPaths.flatMap(path => {
+    if (path === contract.sourcePath) return []
+    if (path === 'internal/ai') return [...MODEL_WRITABLE_AI_PATHS]
+    return [path]
+  })
+  if (fallback.allowedPaths.filter(path => path === contract.sourcePath).length !== 1
+    || fallback.allowedPaths.filter(path => path === 'internal/ai').length !== 1
+    || !job.policy.modelReadablePaths?.includes(contract.sourcePath)
+    || !job.policy.modelReadablePaths.includes('internal/ai')) {
+    throw new Error('reviewed Dockershrink client sources do not match their exact readable policy paths')
   }
   return RepositoryPolicySchema.parse({ ...fallback, allowedPaths })
 }

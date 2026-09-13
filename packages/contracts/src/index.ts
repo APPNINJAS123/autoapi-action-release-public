@@ -1,7 +1,12 @@
 import { z } from 'zod'
 
 export const SCHEMA_VERSION = '1.0' as const
-export const MAX_HARNESS_JOB_RUNTIME_MS = 10 * 60 * 1000
+// A repair-capable migration needs one bounded worker pass, one bounded master
+// repair pass, and a separate validation reserve. Large reviewed repositories
+// can legitimately spend more than five minutes in the worker pass, so the
+// former ten-minute cap could make the configured repair path unreachable even
+// when the repository policy explicitly allowed fifteen minutes.
+export const MAX_HARNESS_JOB_RUNTIME_MS = 15 * 60 * 1000
 export const MAX_HARNESS_VALIDATION_RESERVE_MS = 3 * 60 * 1000
 
 export function boundedHarnessJobRuntimeMs(maxRunTimeMs: number): number {
