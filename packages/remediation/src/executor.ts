@@ -701,29 +701,43 @@ export class DeepSeekHarnessMigrationExecutor implements MigrationExecutor {
         if (runRemainingMs <= 0) {
           throw timeoutError()
         }
-        const result = await runWithDeadline(
-          runtime.run(retryableFailure === undefined ? contextForAttempt.prompt : [
-            contextForAttempt.prompt,
-            retryableFailure instanceof HarnessInitialModelTimeoutError
-              ? 'FALLBACK FEEDBACK: The initial model produced no completed response inside its bounded runtime. Treat this as a fresh decision from the supplied hash-bound context; do not infer or reuse a partial response.'
-              : 'RETRY FEEDBACK: The previous bounded model response was rejected by code-owned validation.',
-            `Failure: ${retryableFailure.message}`,
-            ...(retryableFailure instanceof HarnessResponseFormatError ? [
-              'RESPONSE STRUCTURE CORRECTION: Return one complete JSON object with summary, confidence, and edits as top-level siblings. Never put summary or confidence inside edits[0] or a replacement. Write summary and numeric confidence before the edits array, then close every replacement, edit object, edits array, and the outer object. Do not omit required fields or return a JSON fragment.',
-            ] : []),
-            ...(retryableFailure instanceof HarnessAmbiguousReplacementError ? [
-              'AMBIGUOUS REPLACEMENT: A short old snippet also matched unrelated code. Expand old with unchanged surrounding lines copied from the supplied source until it uniquely identifies the intended affected usage; preserve those context lines exactly in new. Do not change the other matches or widen the evidence boundary. Use separate non-overlapping contextual replacements for separately authorized usages.',
-            ] : []),
-            ...(retryableFailure instanceof HarnessBehaviorContractError ? [
-              'BEHAVIOR CONTRACT CORRECTION: The code-owned validator rejected an observable behavior regression. Satisfy every behaviorObligations entry. Keep throwing client construction after the existing configuration guard; retain the original transport fallback for errors without an HTTP status; narrow optional provider statuses before passing them to an HTTP response; preserve the evidence-backed provider payload field; and retain unmapped methods through the exact evidenced compatibility namespace instead of throwing or no-oping. Coordinate separate allowed ranges when setup must move across a protected guard, while preserving the protected block exactly.',
-            ] : []),
-            'Return a fresh, complete JSON object. Copy every replacement.old exactly from the supplied file, keep replacements minimal, and ensure no replacement ranges overlap.',
-          ].join('\n'), {
-            sessionId: `migration-${input.jobId}-${input.repairAttempt}-${sessionScope === 'combined' ? '' : `${sessionScope}-`}${contextForAttempt === maxTokensContext ? 'evidence-' : ''}${attempt.model}-${attemptIndex}${transientTransportRetries === 0 ? '' : `-transport-${transientTransportRetries}`}-${executionId}`,
-          }),
-          Math.min(runRemainingMs, sharedRemainingMs),
-          timeoutError,
-        )
+        let result: HarnessRunResult
+        try {
+          result = await runWithDeadline(
+            runtime.run(retryableFailure === undefined ? contextForAttempt.prompt : [
+              contextForAttempt.prompt,
+              retryableFailure instanceof HarnessInitialModelTimeoutError
+                ? 'FALLBACK FEEDBACK: The initial model produced no completed response inside its bounded runtime. Treat this as a fresh decision from the supplied hash-bound context; do not infer or reuse a partial response.'
+                : 'RETRY FEEDBACK: The previous bounded model response was rejected by code-owned validation.',
+              `Failure: ${retryableFailure.message}`,
+              ...(retryableFailure instanceof HarnessResponseFormatError ? [
+                'RESPONSE STRUCTURE CORRECTION: Return one complete JSON object with summary, confidence, and edits as top-level siblings. Never put summary or confidence inside edits[0] or a replacement. Write summary and numeric confidence before the edits array, then close every replacement, edit object, edits array, and the outer object. Do not omit required fields or return a JSON fragment.',
+              ] : []),
+              ...(retryableFailure instanceof HarnessAmbiguousReplacementError ? [
+                'AMBIGUOUS REPLACEMENT: A short old snippet also matched unrelated code. Expand old with unchanged surrounding lines copied from the supplied source until it uniquely identifies the intended affected usage; preserve those context lines exactly in new. Do not change the other matches or widen the evidence boundary. Use separate non-overlapping contextual replacements for separately authorized usages.',
+              ] : []),
+              ...(retryableFailure instanceof HarnessBehaviorContractError ? [
+                'BEHAVIOR CONTRACT CORRECTION: The code-owned validator rejected an observable behavior regression. Satisfy every behaviorObligations entry. Keep throwing client construction after the existing configuration guard; retain the original transport fallback for errors without an HTTP status; narrow optional provider statuses before passing them to an HTTP response; preserve the evidence-backed provider payload field; and retain unmapped methods through the exact evidenced compatibility namespace instead of throwing or no-oping. Coordinate separate allowed ranges when setup must move across a protected guard, while preserving the protected block exactly.',
+              ] : []),
+              'Return a fresh, complete JSON object. Copy every replacement.old exactly from the supplied file, keep replacements minimal, and ensure no replacement ranges overlap.',
+            ].join('\n'), {
+              sessionId: `migration-${input.jobId}-${input.repairAttempt}-${sessionScope === 'combined' ? '' : `${sessionScope}-`}${contextForAttempt === maxTokensContext ? 'evidence-' : ''}${attempt.model}-${attemptIndex}${transientTransportRetries === 0 ? '' : `-transport-${transientTransportRetries}`}-${executionId}`,
+            }),
+            Math.min(runRemainingMs, sharedRemainingMs),
+            timeoutError,
+          )
+        } catch (error) {
+          // The external SDK can reject before emitting a terminal turn (for
+          // example when its child transport closes). Never surface its raw
+          // exception, which may contain provider output or credentials. Keep
+          // executor-owned deadline failures intact and give the next already-
+          // budgeted model attempt one generic, bounded retry signal.
+          if (error instanceof HarnessExecutionError) throw error
+          throw new HarnessExecutionError(
+            'Harness runtime failed before producing a completed response',
+            true,
+          )
+        }
         if (result.finishReason !== 'completed') {
           const suffix = result.diagnostic === undefined ? '' : `: ${result.diagnostic}`
           const message = `Harness ${attempt.model} finished with ${result.finishReason ?? 'no finish reason'}${suffix}`
