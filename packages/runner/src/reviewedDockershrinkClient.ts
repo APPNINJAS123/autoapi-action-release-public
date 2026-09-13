@@ -28,6 +28,31 @@ const MODEL_OMITTED_COMPATIBLE_PATHS = new Set([
   SOURCE_PATH,
   'internal/ai/ai.go',
 ])
+const REQUIRED_SDK_TYPE_SNIPPETS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  'internal/ai/generate.go': Object.freeze([
+    'Name:        "generated_asset",',
+    'Description: openai.String("Dockerfile generated for the project along with any comments you would like to add"),',
+    'Schema:      generateResponseSchema,',
+  ]),
+  'internal/ai/optimize.go': Object.freeze([
+    'Name:        "modifications",',
+    'Description: openai.String("Optimized assets for the project along with the actions taken and further recommendations"),',
+    'Schema:      optimizeResponseSchema,',
+  ]),
+  'internal/ai/tools.go': Object.freeze([
+    'Name:        ToolReadFiles,',
+    'Name:        ToolDeveloperFeedback,',
+  ]),
+})
+const FORBIDDEN_SDK_TYPE_SNIPPETS = Object.freeze([
+  'Name:        openai.String("generated_asset"),',
+  'Name:        openai.String("modifications"),',
+  'Description: "Dockerfile generated for the project along with any comments you would like to add",',
+  'Description: "Optimized assets for the project along with the actions taken and further recommendations",',
+  'Name:        openai.String(ToolReadFiles),',
+  'Name:        openai.String(ToolDeveloperFeedback),',
+  'Function: constant.Function',
+])
 
 /**
  * Bind one mechanical pointer adapter to the exact reviewed Dockershrink job.
@@ -45,6 +70,25 @@ export function reviewedDockershrinkClientSeed(
     seededSha256: '6a3cb6bc8f3b6f6ffafc7619dbbad9f1b0623908240c37e0ae28f95dec88ab8b',
     oldCall: OLD_CALL,
     seededCall: SEEDED_CALL,
+  }
+}
+
+/**
+ * Preserve the independently compiled beta.1 field types for the exact
+ * Dockershrink acceptance job. Adjacent fields deliberately have different
+ * Go types (plain string versus param.Opt[string]); keeping that distinction
+ * in the Harness behavior contract prevents repair attempts from oscillating
+ * between two individually plausible but uncompilable variants.
+ */
+export function reviewedDockershrinkTextMigration(jobInput: MigrationJob): {
+  requiredSnippetsByPath: Readonly<Record<string, readonly string[]>>
+  forbiddenSnippets: readonly string[]
+} | undefined {
+  const job = MigrationJobSchema.parse(jobInput)
+  if (!matchesReviewedJob(job)) return undefined
+  return {
+    requiredSnippetsByPath: REQUIRED_SDK_TYPE_SNIPPETS,
+    forbiddenSnippets: FORBIDDEN_SDK_TYPE_SNIPPETS,
   }
 }
 

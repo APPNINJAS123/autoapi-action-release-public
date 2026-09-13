@@ -91,6 +91,7 @@ import {
   reviewedDockershrinkClientViolations,
   reviewedDockershrinkModelFiles,
   reviewedDockershrinkModelPolicy,
+  reviewedDockershrinkTextMigration,
 } from './reviewedDockershrinkClient.js'
 
 const MAX_VALIDATION_CONTEXT_CHARACTERS = 8_000
@@ -221,6 +222,8 @@ export class ProposalRunner {
       const firecrawlHybridSeedEnabled = isVerifiedFirecrawlHybrid(job.changeEvent)
       const instructionSeedEnabled = verifiedInstructionMethodMappings(job.changeEvent).size > 0
       const repositoryImportSeed = reviewedSymfonyPredisImportSeed(job)
+      const reviewedDockershrinkTextContract = reviewedDockershrinkTextMigration(job)
+      const repositoryTextContract = repositoryImportSeed ?? reviewedDockershrinkTextContract
       const codeOwnedSeedEnabled = firecrawlHybridSeedEnabled
         || instructionSeedEnabled
         || repositoryImportSeed !== undefined
@@ -375,12 +378,12 @@ export class ProposalRunner {
             policy: { ...modelPolicy, allowedNetworkHosts: [this.harnessNetworkHost] },
             unresolvedFiles,
             ...(repairEditBoundaries.length === 0 ? {} : { repairEditBoundaries }),
-            ...(repositoryImportSeed === undefined ? {} : {
-              trustedTextMigrations: Object.entries(repositoryImportSeed.requiredSnippetsByPath)
+            ...(repositoryTextContract === undefined ? {} : {
+              trustedTextMigrations: Object.entries(repositoryTextContract.requiredSnippetsByPath)
                 .map(([path, requiredSnippets]) => ({
                   path,
                   requiredSnippets: [...requiredSnippets],
-                  forbiddenSnippets: [...repositoryImportSeed.forbiddenSnippets],
+                  forbiddenSnippets: [...repositoryTextContract.forbiddenSnippets],
                 })),
             }),
             repairAttempt: job.repairAttempt,

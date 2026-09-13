@@ -72,6 +72,7 @@ export {
   reviewedDdTraceModelPolicy,
   reviewedSymfonyPredisImportSeed,
 } from './repositoryEventBindings.js'
+export { reviewedDockershrinkTextMigration } from './reviewedDockershrinkClient.js'
 export {
   analyzePreparation,
   shouldDeferPreliminaryProposal,
